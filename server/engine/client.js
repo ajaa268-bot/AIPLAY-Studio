@@ -52,8 +52,10 @@
  * Neither is worth it today; both are named so nobody has to rediscover that.
  */
 import { EventEmitter } from "node:events";
+import { mkdir, writeFile } from "node:fs/promises";
 import { externalMusicWork } from "../music/exclusive.js";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import WebSocket from "ws";
@@ -157,6 +159,7 @@ export function createEngineClient(deps = {}) {
   /* ── the port, and who owns it ─────────────────────────────────────────── */
 
   let PORT = deps.port ?? null;
+  let headlessUrl = null;
   let pinned = false;
   let pinnedWhy = null;
   let revealed = false;
@@ -164,16 +167,17 @@ export function createEngineClient(deps = {}) {
   let facts = { version: null, argv: null, argvHash: null, at: null };
 
   /** ⚠ NEVER EXPORTED, never returned by a route, never logged. */
-  const base = () => `http://${LISTEN_HOST}:${PORT}`;
+  const base = () => headlessUrl || `http://${LISTEN_HOST}:${PORT}`;
 
-  const portMode = () => (pinned ? "pinned" : revealed ? "revealed" : "ephemeral");
+  const portMode = () => (headlessUrl ? "headless" : pinned ? "pinned" : revealed ? "revealed" : "ephemeral");
   /** The number is only ever disclosed once it is already discoverable — a
    *  pinned port was published by the person who pinned it, and a revealed one
    *  left a dated line in the ledger saying so. */
-  const disclosablePort = () => (pinned || revealed ? PORT : null);
+  const disclosablePort = () => (headlessUrl || pinned || revealed ? PORT : null);
 
   function setPort(n, { pin = false, why = null } = {}) {
     const changed = PORT !== null && PORT !== n;
+    headlessUrl = null;
     PORT = n;
     pinned = pin;
     pinnedWhy = why;
@@ -181,6 +185,20 @@ export function createEngineClient(deps = {}) {
     facts = { version: null, argv: null, argvHash: null, at: null };
     if (changed) bus.emit("rebound", { mode: portMode() });
     return n;
+  }
+
+  function attachHeadless(rawUrl) {
+    const u = new URL(String(rawUrl));
+    headlessUrl = u.origin + (u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "");
+    PORT = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+    pinned = false;
+    pinnedWhy = null;
+    revealed = false;
+    facts = { version: null, argv: null, argvHash: null, at: null };
+    child = { headless: true, exitCode: null, signalCode: null, kill() { this.exitCode = 0; } };
+    ranSinceStart = 0;
+    bus.emit("rebound", { mode: portMode() });
+    return child;
   }
 
   /**
@@ -253,7 +271,7 @@ export function createEngineClient(deps = {}) {
    * used one runs at half speed (config.js video.freeBeforeClip). */
   let ranSinceStart = 0;
   function attachChild(proc) { child = proc || null; ranSinceStart = 0; return child; }
-  function detachChild() { child = null; }
+  function detachChild() { child = null; headlessUrl = null; }
   const isOurs = () => !!child && child.exitCode === null && child.signalCode === null;
 
   /**
@@ -302,10 +320,13 @@ export function createEngineClient(deps = {}) {
   /** One `choice` per start, so `/api/provenance?asset=engine` is the whole
    *  history of how exposed this install has been. */
   async function announcePort() {
-    const data = pinned
-      ? { op: "engine_port", mode: "pinned", port: PORT, why: pinnedWhy,
-          note: "anything on this machine can drive this engine directly; those renders will not appear here" }
-      : { op: "engine_port", mode: "ephemeral" };
+    const data = headlessUrl
+      ? { op: "engine_port", mode: "headless", url: headlessUrl, port: PORT,
+          note: "connected to an external headless ComfyUI server" }
+      : pinned
+        ? { op: "engine_port", mode: "pinned", port: PORT, why: pinnedWhy,
+            note: "anything on this machine can drive this engine directly; those renders will not appear here" }
+        : { op: "engine_port", mode: "ephemeral" };
     return prov.append("library", { actor: "system", type: "choice", asset: "engine", data })
       .catch((e) => { console.warn(`  [engine] start not recorded: ${e.message}`); return null; });
   }
@@ -319,7 +340,7 @@ export function createEngineClient(deps = {}) {
 
   /* ── the wire ──────────────────────────────────────────────────────────── */
 
-  const ready = () => PORT !== null;
+  const ready = () => PORT !== null || Boolean(headlessUrl);
 
   async function getJSON(pathname, timeoutMs = poll.POLL_TIMEOUT_MS) {
     const r = await doFetch(`${base()}${pathname}`, { signal: AbortSignal.timeout(timeoutMs) });
@@ -342,6 +363,155 @@ export function createEngineClient(deps = {}) {
   const history = (promptId) => getJSON(promptId ? `/history/${promptId}` : "/history");
   const queue = () => getJSON("/queue");
   const objectInfo = (cls) => getJSON(cls ? `/object_info/${encodeURIComponent(cls)}` : "/object_info", 30_000);
+
+  async function probeHeadlessUrl(rawUrl, timeoutMs = 2500) {
+    let url = null;
+    try {
+      const s = String(rawUrl || "").trim();
+      if (!s) return { ok: false, error: "Enter a valid HTTP(S) URL." };
+      const u = new URL(/^https?:\/\//i.test(s) ? s : `http://${s}`);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return { ok: false, error: "Only HTTP(S) URLs are supported." };
+      url = u.origin + (u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "");
+    } catch {
+      return { ok: false, error: "Enter a valid HTTP(S) URL." };
+    }
+    try {
+      const r = await doFetch(`${url}/system_stats`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!r.ok) return { ok: false, url, error: `Server responded with HTTP ${r.status}` };
+      const s = await r.json();
+      const dev0 = Array.isArray(s?.devices) ? s.devices[0] : null;
+      return {
+        ok: true,
+        url,
+        version: s?.system?.comfyui_version || "ComfyUI",
+        torch: s?.system?.pytorch_version || null,
+        device: dev0?.name || null,
+        vramMb: Number.isFinite(dev0?.vram_total) ? Math.round(dev0.vram_total / 1048576) : null,
+      };
+    } catch (e) {
+      return { ok: false, url, error: `Could not reach ${url} (${e.message || e})` };
+    }
+  }
+
+  /**
+   * Scan the local network (or a user-provided host/subnet) for running
+   * ComfyUI servers answering `/system_stats`. Universal across any LAN.
+   */
+  async function scanLanComfyServers({ customHost = "", ports = [8188], timeoutMs = 450 } = {}) {
+    const portList = Array.isArray(ports) && ports.length
+      ? ports.map((p) => Number(p)).filter((p) => Number.isInteger(p) && p > 0 && p < 65536)
+      : [8188];
+    const candidates = new Set();
+    for (const p of portList) {
+      candidates.add(`http://127.0.0.1:${p}`);
+    }
+    const raw = String(customHost || "").trim();
+    const subnets = [];
+    if (raw) {
+      const subMatch = raw.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})(?:\.\*|\.0\/24)?$/);
+      if (subMatch) {
+        subnets.push(subMatch[1]);
+      } else {
+        const hasPort = /:\d+(\/|$)/.test(raw);
+        if (hasPort || /^https?:\/\//i.test(raw)) {
+          candidates.add(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
+        } else {
+          for (const p of portList) candidates.add(`http://${raw}:${p}`);
+        }
+      }
+    }
+    if (!subnets.length) {
+      const nets = os.networkInterfaces();
+      for (const list of Object.values(nets)) {
+        for (const iface of list || []) {
+          if (!iface || iface.internal || iface.family !== "IPv4") continue;
+          const parts = String(iface.address || "").split(".");
+          if (parts.length === 4 && (parts[0] === "192" || parts[0] === "10" || parts[0] === "172")) {
+            const prefix = `${parts[0]}.${parts[1]}.${parts[2]}`;
+            if (!subnets.includes(prefix) && subnets.length < 2) subnets.push(prefix);
+          }
+        }
+      }
+    }
+    for (const prefix of subnets) {
+      for (let host = 1; host <= 254; host++) {
+        for (const p of portList) {
+          candidates.add(`http://${prefix}.${host}:${p}`);
+        }
+      }
+    }
+    const urls = [...candidates];
+    const found = [];
+    const batchSize = 48;
+    for (let i = 0; i < urls.length; i += batchSize) {
+      const slice = urls.slice(i, i + batchSize);
+      const res = await Promise.all(slice.map((u) => probeHeadlessUrl(u, timeoutMs)));
+      for (const r of res) {
+        if (r?.ok && r.url) {
+          const cleanGpu = r.device ? r.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim() : null;
+          found.push({
+            url: r.url,
+            label: `${r.url.replace(/^https?:\/\//, "")}${cleanGpu ? ` · ${cleanGpu}` : ""}${r.vramMb ? ` (${(r.vramMb / 1024).toFixed(1)} GB)` : ""}`,
+            online: true,
+            version: r.version || null,
+            torch: r.torch || null,
+            device: r.device || null,
+            vramMb: r.vramMb || null,
+          });
+        }
+      }
+    }
+    return { ok: true, subnets, servers: found };
+  }
+
+  /**
+   * Query a running local or networked ComfyUI server for the model files it
+   * has available across its shelves (`GET /models/<folder>`).
+   */
+  async function scanRemoteComfyModels(rawUrl, timeoutMs = 4000) {
+    const probe = await probeHeadlessUrl(rawUrl, timeoutMs);
+    if (!probe.ok) return probe;
+    const url = probe.url;
+    const wantedShelves = [
+      "checkpoints", "diffusion_models", "unet", "vae", "loras",
+      "text_encoders", "clip", "audio_encoders", "controlnet", "upscale_models",
+    ];
+    let availableShelves = wantedShelves;
+    try {
+      const r = await doFetch(`${url}/models`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (r.ok) {
+        const list = await r.json();
+        if (Array.isArray(list)) {
+          availableShelves = wantedShelves.filter((s) => list.includes(s));
+        }
+      }
+    } catch { /* fall back to probing wantedShelves directly */ }
+
+    const folders = {};
+    let totalFiles = 0;
+    await Promise.all(availableShelves.map(async (shelf) => {
+      try {
+        const r = await doFetch(`${url}/models/${encodeURIComponent(shelf)}`, { signal: AbortSignal.timeout(timeoutMs) });
+        if (!r.ok) return;
+        const files = await r.json();
+        if (Array.isArray(files) && files.length) {
+          folders[shelf] = files.map(String);
+          totalFiles += files.length;
+        }
+      } catch { /* ignore shelf error */ }
+    }));
+
+    return {
+      ok: true,
+      url,
+      version: probe.version,
+      torch: probe.torch,
+      device: probe.device,
+      vramMb: probe.vramMb,
+      totalFiles,
+      folders,
+    };
+  }
 
   async function interrupt() {
     try { await doFetch(`${base()}/interrupt`, { method: "POST", signal: AbortSignal.timeout(5000) }); return { stopped: true }; }
@@ -390,7 +560,8 @@ export function createEngineClient(deps = {}) {
    *  relisten on "rebound": after a restart the old port is somebody else's
    *  problem, or nobody's. */
   function socket(clientId) {
-    return new Socket(`ws://${LISTEN_HOST}:${PORT}/ws?clientId=${encodeURIComponent(String(clientId ?? ""))}`);
+    const wsBase = headlessUrl ? headlessUrl.replace(/^http/i, "ws") : `ws://${LISTEN_HOST}:${PORT}`;
+    return new Socket(`${wsBase}/ws?clientId=${encodeURIComponent(String(clientId ?? ""))}`);
   }
 
   /**
@@ -406,8 +577,12 @@ export function createEngineClient(deps = {}) {
     try {
       const s = await systemStats(2500);
       const argv = Array.isArray(s?.system?.argv) ? s.system.argv : null;
+      const dev0 = Array.isArray(s?.devices) ? s.devices[0] : null;
       facts = {
         version: s?.system?.comfyui_version ?? null,
+        torch: s?.system?.pytorch_version ?? null,
+        device: dev0?.name ?? null,
+        vramMb: Number.isFinite(dev0?.vram_total) ? Math.round(dev0.vram_total / 1048576) : null,
         argv,
         argvHash: argv ? sha256(sortedJSON(argv)) : null,
         at: Date.now(),
@@ -1158,7 +1333,19 @@ export function createEngineClient(deps = {}) {
       for (const kind of ["images", "videos", "audio", "gifs", "3d"]) {
         for (const o of byKind?.[kind] || []) {
           if (!o?.filename) continue;
-          const facts_ = await store.outputFacts(o);
+          let facts_ = await store.outputFacts(o);
+          if (headlessUrl && facts_.bytes === null && facts_.resolvedPath) {
+            try {
+              const qs = new URLSearchParams({ filename: o.filename, subfolder: o.subfolder || "", type: o.type || "output" });
+              const vr = await doFetch(`${base()}/view?${qs.toString()}`, { signal: AbortSignal.timeout(poll.POST_TIMEOUT_MS) });
+              if (vr.ok) {
+                const buf = Buffer.from(await vr.arrayBuffer());
+                await mkdir(path.dirname(facts_.resolvedPath), { recursive: true });
+                await writeFile(facts_.resolvedPath, buf);
+                facts_ = await store.outputFacts(o);
+              }
+            } catch { /* remote output pull best-effort */ }
+          }
           const row = {
             node, kind: kind.replace(/s$/, ""), file: o.filename, subfolder: o.subfolder || "",
             /* ComfyUI 0.36 makes LoadVideo echo its INPUT file as an output row (type "input"); the kind is kept so a reader can tell the echo from what the graph wrote. */
@@ -1247,12 +1434,13 @@ export function createEngineClient(deps = {}) {
 
   return {
     // lifecycle — only the supervisor calls these
-    reservePort, pinPort, pinFromEnv, attachChild, detachChild, isOurs, announcePort, announceTier,
+    reservePort, pinPort, pinFromEnv, attachChild, attachHeadless, detachChild, isOurs, announcePort, announceTier,
+    headlessFacts: () => facts,
     setAdopter,
     listenHost: LISTEN_HOST,
     // wire — everyone else
     dispatch, run, submit, socket, cancelRun, interrupt, clearQueue, freeMemory,
-    history, queue, objectInfo, systemStats, identity, probePort, refreshFacts,
+    history, queue, objectInfo, systemStats, identity, probePort, probeHeadlessUrl, scanLanComfyServers, scanRemoteComfyModels, refreshFacts,
     status, activity, runRecord, reveal, hold, pauseSubmissions,
     ranSinceStart: () => ranSinceStart,
     // events

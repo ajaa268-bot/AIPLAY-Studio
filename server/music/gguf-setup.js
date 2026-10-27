@@ -44,14 +44,19 @@ export const RUNTIME_KINDS=Object.freeze({
     requirements:Object.freeze({platform:'win32',arch:'x64',driver:'Any current AMD, Intel or NVIDIA graphics driver (they include Vulkan). The Visual C++ runtime ships inside the archive.'}),
     licence:Object.freeze({label:'YuE2 weights: licence file CC BY-NC 4.0; the authors say individuals may sell what it makes (15 Sep 2026) and companies need a commercial licence. Native code: Apache-2.0/MIT (official audio.cpp v0.8.1 release).',
       url:'https://huggingface.co/audio-cpp/Yue2-3B-GGUF'})}),
+  linux_vulkan:Object.freeze({label:'Linux Vulkan (AMD, Intel or NVIDIA)',manifest:'yue-runtime-manifest-linux-vulkan.json',backend:'vulkan',
+    requirements:Object.freeze({platform:'linux',arch:'x64',driver:'Any Linux graphics driver with Vulkan (Mesa RADV for AMD, Mesa ANV for Intel, or NVIDIA proprietary Vulkan ICD).'}),
+    licence:Object.freeze({label:'YuE2 weights: licence file CC BY-NC 4.0; the authors say individuals may sell what it makes (15 Sep 2026) and companies need a commercial licence. Native code: Apache-2.0/MIT (official audio.cpp v0.8.1 release).',
+      url:'https://huggingface.co/audio-cpp/Yue2-3B-GGUF'})}),
   cpu:Object.freeze({label:'CPU only',manifest:'yue-runtime-manifest-cpu.json',backend:'cpu',
     requirements:Object.freeze({platform:'win32',arch:'x64',driver:'No graphics card needed. Much slower than a GPU. The Visual C++ runtime ships inside the archive.'}),
     licence:Object.freeze({label:'YuE2 weights: licence file CC BY-NC 4.0; the authors say individuals may sell what it makes (15 Sep 2026) and companies need a commercial licence. Native code: Apache-2.0/MIT (official audio.cpp v0.8.1 release).',
       url:'https://huggingface.co/audio-cpp/Yue2-3B-GGUF'})}),
 });
 /** Pure: which runtime to install. An explicit choice wins; otherwise the card decides. */
-export function runtimeKindFor({preferred='auto',vendor=null,cpuOnly=false}={}) {
+export function runtimeKindFor({preferred='auto',vendor=null,cpuOnly=false,platform='win32'}={}) {
   if (Object.hasOwn(RUNTIME_KINDS,preferred)) return preferred;
+  if (platform==='linux') return 'linux_vulkan';
   if (vendor==='nvidia') return 'cuda';
   if (vendor) return 'vulkan';
   return cpuOnly ? 'cpu' : 'vulkan';
@@ -97,7 +102,7 @@ export function validateRuntimeManifest(m) {
   if (m?.schema!==1 || !Array.isArray(m.archives) || m.archives.length<1 || m.archives.length>2) throw new Error('Native runtime manifest unavailable.');
   const names=new Set(), archives=new Set();let total=0;
   for (const a of m.archives) {
-    if (!safeName(a.name) || a.name.includes('/') || !a.name.endsWith('.zip') || archives.has(a.name.toLowerCase())
+    if (!safeName(a.name) || a.name.includes('/') || !(a.name.endsWith('.zip') || a.name.endsWith('.tar.gz')) || archives.has(a.name.toLowerCase())
       || !sizeHash(a) || !/^https:\/\//.test(a.url) || !Array.isArray(a.files) || !a.files.length || a.files.length>256) throw new Error('Invalid native runtime archive manifest.');
     archives.add(a.name.toLowerCase());
     for (const f of a.files) {
@@ -105,12 +110,18 @@ export function validateRuntimeManifest(m) {
       names.add(f.name.toLowerCase());total+=f.bytes;
     }
   }
-  if (!names.has('audiocpp_cli.exe') || total>4*1024**3) throw new Error('Invalid native runtime size or executable.');
+  if (!(names.has('audiocpp_cli.exe') || (m?.platform==='linux' && names.has('audiocpp_cli'))) || total>4*1024**3) throw new Error('Invalid native runtime size or executable.');
   return m;
 }
 
 async function extractNative(archive,destination,list,{signal}) {
   signal.throwIfAborted();
+  if (archive.endsWith('.tar.gz')) {
+    await mkdir(destination,{recursive:true});
+    await execFileClosed('tar',['-xzf',archive,'--no-same-owner','--no-same-permissions','-C',destination],
+      {windowsHide:true,timeout:180000,maxBuffer:65536,signal});
+    return;
+  }
   await execFileClosed('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',
     path.join(ROOT,'scripts/extract-yue-runtime.ps1'),'-Archive',archive,'-Destination',destination,'-Manifest',list],
     {windowsHide:true,timeout:180000,maxBuffer:65536,signal});
@@ -143,7 +154,7 @@ export class GgufSetup {
   }
   runtimeKind() {
     return runtimeKindFor({preferred:this.settings.yueGguf?.runtime,vendor:this.settings.gpu?.vendor||null,
-      cpuOnly:this.settings.engineInstall?.backend==='cpu'});
+      cpuOnly:this.settings.engineInstall?.backend==='cpu',platform:this.platform});
   }
   async manifest(kind=this.runtimeKind()) {
     const m=JSON.parse(await readFile(path.join(ROOT,'server/music',RUNTIME_KINDS[kind].manifest),'utf8'));
@@ -195,7 +206,7 @@ export class GgufSetup {
       error:this.error||null,errorQuantization:this.error?this.lastQuantization:null,
       cleanupWarning:this.cleanupWarning||null,requirements:rk.requirements,licence:rk.licence,
       runtimeKind:kind,runtimeLabel:rk.label,backend,
-      available:!!manifest && this.platform==='win32' && this.arch==='x64',
+      available:!!manifest && (this.platform==='win32' || this.platform==='linux') && this.arch==='x64',
       paths:{runtime:kit.cli,models:kit.modelDir},runtimeVersion:runtime.version||null,
       integrity:'Files are hash-verified during installation. Readiness later checks sizes and the native version; it is not a new full-file hash scan.'};
   }

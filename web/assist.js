@@ -234,8 +234,20 @@ function ownModel(P, box) {
     picking = false;
     copy?.();
   });
+  const settle = () => {
+    if (!picking || !pick.value) return;
+    if (file.value !== pick.value) {
+      file.value = pick.value;
+      file.dispatchEvent(new Event("input", { bubbles: true }));
+      file.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    picking = false;
+    copy?.();
+  };
   /* Reopened and left on the same file: that is a choice too. */
   pick.addEventListener("blur", () => { if (picking && file.value && pick.value === file.value) { picking = false; copy?.(); } });
+  box.querySelector("textarea")?.addEventListener("focus", settle);
+  box.querySelector("form")?.addEventListener("submit", settle, true);
   file.addEventListener("change", () => copy?.());
   new MutationObserver(() => copy?.()).observe(file, { childList: true, subtree: true });
   copy?.();
@@ -394,7 +406,17 @@ function mount(kind) {
     if (ev.type === "tool_result") {
       if (ev.error) { t.failed = true; return row("fail", `${esc(ev.tool)} did not work: ${esc(ev.error)}`); }
       const r = ev.result || {};
-      if (r.form?.fields) { t.set = true; await applyFields(r.form.fields); row("did", `✓ Set ${esc(r.changed || "the form")}`); }
+      if (r.form?.fields) {
+        t.set = true;
+        const next = { ...r.form.fields };
+        const askedModel = /\b(use|switch|engine|model|flux|qwen|z-?image|anima|krea|moss|checkpoint|sdxl|illustrious|pony|h3|minimax|ltx|wan)\b/i.test(t.message || "");
+        if (!askedModel) {
+          delete next[P.engine];
+          if (P.own?.pick) delete next[P.own.pick];
+        }
+        await applyFields(next);
+        row("did", `✓ Set ${esc(r.changed || "the form")}`);
+      }
       if (r.action === "generate") {
         t.started = true;
         const got = await pressMake(kind);
@@ -419,7 +441,7 @@ function mount(kind) {
     message = String(message || "").trim();
     if (busy || !message) return;
     setBusy(true);
-    turn = { make, set: false, started: false, proposed: false, failed: false, stopped: false };
+    turn = { make, message, set: false, started: false, proposed: false, failed: false, stopped: false };
     stream = new AbortController();
     row("me", esc(message));
     say("Thinking…");

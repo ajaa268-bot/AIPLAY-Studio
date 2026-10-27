@@ -8381,12 +8381,99 @@ $("qVideoWhen").onchange = async () => {
  * need a restart — the engine takes them as launch arguments, so pretending
  * they apply immediately would mean songs written somewhere the library is not
  * looking, with no error to explain it. */
+let comfyPresetsCache = { regularInstalls: [], modelFolders: [], headlessServers: [] };
+let comfyExtraModelsDirs = [];
+
+function renderComfyModelsAlsoChips() {
+  const el = $("qModelsAlsoChips");
+  if (!el) return;
+  if (!comfyExtraModelsDirs.length) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = `<span class="hint">Extra model folders:</span>` + comfyExtraModelsDirs.map((p, idx) =>
+    `<button class="btn2" type="button" data-remove-also="${idx}" title="Click to remove extra folder">${esc(p)} ✕</button>`
+  ).join("");
+}
+
+function renderComfyDiscoveryControls(presets) {
+  if (!presets) return;
+  if (Array.isArray(presets.regularInstalls)) comfyPresetsCache.regularInstalls = presets.regularInstalls;
+  if (Array.isArray(presets.modelFolders)) comfyPresetsCache.modelFolders = presets.modelFolders;
+  if (Array.isArray(presets.headlessServers)) comfyPresetsCache.headlessServers = presets.headlessServers;
+
+  if ($("qComfyServerSelect")) {
+    const cur = $("qComfyUrl")?.value.trim() || "";
+    $("qComfyServerSelect").innerHTML = `<option value="">— Select a discovered ComfyUI server (${comfyPresetsCache.headlessServers.length} found) —</option>` +
+      comfyPresetsCache.headlessServers.map((srv) => {
+        const hw = srv.online
+          ? ` · Online${srv.device ? ` (${srv.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim()})` : ""}`
+          : " · Offline";
+        return `<option value="${esc(srv.url)}"${srv.url === cur ? " selected" : ""}>${esc(srv.label)}${esc(hw)}</option>`;
+      }).join("");
+  }
+
+  if ($("qRigSelect")) {
+    const cur = $("qRigDir")?.value.trim() || "";
+    $("qRigSelect").innerHTML = `<option value="">— Select a discovered ComfyUI install (${comfyPresetsCache.regularInstalls.length} found) —</option>` +
+      comfyPresetsCache.regularInstalls.map((inst, i) => {
+        const pyInfo = inst.python ? " · venv ready" : " · system python";
+        const mInfo = inst.modelCount ? ` · ${inst.modelCount} models` : "";
+        return `<option value="${i}"${inst.rig === cur ? " selected" : ""}>${esc(inst.label)}${esc(pyInfo)}${esc(mInfo)}</option>`;
+      }).join("");
+  }
+
+  if ($("qModelsSelect")) {
+    const cur = $("qModelsDir")?.value.trim() || "";
+    $("qModelsSelect").innerHTML = `<option value="">— Select a discovered models folder (${comfyPresetsCache.modelFolders.length} found) —</option>` +
+      comfyPresetsCache.modelFolders.map((mf) => {
+        const stats = mf.modelCount ? ` (${mf.modelCount} files · ${mf.sizeGb || 0} GB)` : "";
+        return `<option value="${esc(mf.path)}"${mf.path === cur ? " selected" : ""}>${esc(mf.label)}${esc(stats)} — ${esc(mf.path)}</option>`;
+      }).join("");
+  }
+
+  if ($("comfyUrlPresets")) {
+    if (comfyPresetsCache.headlessServers.length) {
+      $("comfyUrlPresets").innerHTML = `<span class="hint">Discovered servers:</span>` + comfyPresetsCache.headlessServers.map((srv) => {
+        const hw = srv.online
+          ? ` · Online${srv.device ? ` (${srv.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim()})` : ""}`
+          : "";
+        return `<button class="btn2" type="button" data-fill-target="qComfyUrl" data-fill-mode="headless" data-fill-val="${esc(srv.url)}">${srv.online ? "● " : ""}${esc(srv.label)}${esc(hw)}</button>`;
+      }).join("");
+    } else {
+      $("comfyUrlPresets").innerHTML = "";
+    }
+  }
+
+  if ($("comfyRigPresets")) {
+    const installs = (comfyPresetsCache.regularInstalls || []).map((inst) =>
+      `<button class="btn2" type="button" data-fill-rig="${esc(inst.rig)}" data-fill-py="${esc(inst.python || "")}" data-fill-models="${esc(inst.modelsDir || "")}" data-fill-out="${esc(inst.outputDir || "")}">${esc(inst.label)}</button>`
+    );
+    const models = (comfyPresetsCache.modelFolders || []).map((mf) => {
+      const stats = mf.modelCount ? ` (${mf.modelCount} files)` : "";
+      return `<button class="btn2" type="button" data-fill-target="qModelsDir" data-fill-val="${esc(mf.path)}">Models: ${esc(mf.label)}${esc(stats)}</button>`;
+    });
+    $("comfyRigPresets").innerHTML = (installs.length || models.length)
+      ? `<span class="hint">Discovered installs &amp; models:</span>${installs.join("")}${models.join("")}`
+      : "";
+  }
+}
+
 $("btnSaveDirs").onclick = async () => {
-  const body = { outputDir: $("qOutDir").value.trim(), rig: $("qRigDir").value.trim() };
+  const body = {
+    outputDir: $("qOutDir").value.trim(),
+    rig: $("qRigDir").value.trim(),
+    modelsDir: $("qModelsDir")?.value.trim() || undefined,
+    modelsAlso: comfyExtraModelsDirs,
+    python: $("qComfyPython")?.value.trim() || undefined,
+    comfyMode: $("qComfyMode")?.value || "regular",
+    comfyUrl: $("qComfyUrl")?.value.trim() || undefined,
+  };
   $("btnSaveDirs").disabled = true;
   try {
-    const r = await (await fetch("/api/settings", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    const r = await (await fetch("/api/comfy-source", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "save", ...body }),
     })).json();
     $("dirsNote").textContent = r.error || r.note || "Saved.";
     $("dirsNote").classList.toggle("warn", !!r.error);
@@ -8394,6 +8481,254 @@ $("btnSaveDirs").onclick = async () => {
     $("btnSaveDirs").disabled = false;
   }
 };
+if ($("btnTestDirs")) {
+  $("btnTestDirs").onclick = async () => {
+    $("btnTestDirs").disabled = true;
+    $("dirsNote").textContent = "Testing…";
+    $("dirsNote").classList.remove("warn");
+    try {
+      const mode = $("qComfyMode")?.value || "regular";
+      const r = await (await fetch("/api/comfy-source", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "test",
+          comfyMode: mode,
+          comfyUrl: $("qComfyUrl")?.value.trim(),
+          rig: $("qRigDir")?.value.trim(),
+          python: $("qComfyPython")?.value.trim(),
+        }),
+      })).json();
+      if (r.error || r.ok === false) {
+        $("dirsNote").textContent = r.error || "Check failed.";
+        $("dirsNote").classList.add("warn");
+      } else if (mode === "headless") {
+        if ($("qComfyUrl") && r.url) $("qComfyUrl").value = r.url;
+        $("dirsNote").textContent = `Connected to ${r.url} · ComfyUI ${r.version}${r.torch ? ` · PyTorch ${r.torch}` : ""}${r.device ? ` · ${r.device}` : ""}`;
+      } else {
+        $("dirsNote").textContent = r.note || `Found ComfyUI at ${r.comfyDir} · Python: ${r.python}`;
+      }
+    } catch (e) {
+      $("dirsNote").textContent = e.message || "Could not test.";
+      $("dirsNote").classList.add("warn");
+    } finally {
+      $("btnTestDirs").disabled = false;
+    }
+  };
+}
+async function loadComfyPresets() {
+  try {
+    const r = await (await fetch("/api/comfy-source")).json();
+    if (!r) return;
+    if ($("qComfyMode") && r.comfyMode) $("qComfyMode").value = r.comfyMode;
+    if ($("qComfyUrl") && !($("qComfyUrl").value || "").trim() && r.comfyUrl) $("qComfyUrl").value = r.comfyUrl;
+    if ($("qRigDir") && !($("qRigDir").value || "").trim() && r.rig) $("qRigDir").value = r.rig;
+    if ($("qComfyPython") && !($("qComfyPython").value || "").trim() && (r.python || r.detectedPython)) {
+      const py = r.python || r.detectedPython;
+      if (py !== "headless") $("qComfyPython").value = py;
+    }
+    if ($("qModelsDir") && !($("qModelsDir").value || "").trim() && r.modelsDir) $("qModelsDir").value = r.modelsDir;
+    if ($("qOutDir") && !($("qOutDir").value || "").trim() && r.outputDir) $("qOutDir").value = r.outputDir;
+    if (Array.isArray(r.modelsAlso)) {
+      comfyExtraModelsDirs = [...r.modelsAlso];
+      renderComfyModelsAlsoChips();
+    }
+    if (r.presets) renderComfyDiscoveryControls(r.presets);
+  } catch { /* ignore preset discovery errors */ }
+}
+$("qComfyServerSelect")?.addEventListener("change", (e) => {
+  const val = e.target.value;
+  if (!val) return;
+  if ($("qComfyUrl")) $("qComfyUrl").value = val;
+  if ($("qComfyMode")) $("qComfyMode").value = "headless";
+  $("dirsNote").textContent = `Selected server ${val}. Click Save folders to persist.`;
+  $("dirsNote").classList.remove("warn");
+});
+$("qRigSelect")?.addEventListener("change", (e) => {
+  const idx = Number(e.target.value);
+  const inst = comfyPresetsCache.regularInstalls[idx];
+  if (!inst) return;
+  if ($("qComfyMode")) $("qComfyMode").value = "regular";
+  if ($("qRigDir")) $("qRigDir").value = inst.rig || "";
+  if ($("qComfyPython")) $("qComfyPython").value = inst.python || "";
+  if (inst.modelsDir && $("qModelsDir")) $("qModelsDir").value = inst.modelsDir;
+  if (inst.outputDir && $("qOutDir")) $("qOutDir").value = inst.outputDir;
+  $("dirsNote").textContent = `Selected ComfyUI install at ${inst.rig}. Click Save folders to persist.`;
+  $("dirsNote").classList.remove("warn");
+});
+$("qModelsSelect")?.addEventListener("change", (e) => {
+  const val = e.target.value;
+  if (!val) return;
+  if ($("qModelsDir")) $("qModelsDir").value = val;
+  $("dirsNote").textContent = `Selected models folder ${val}. Click Save folders to persist.`;
+  $("dirsNote").classList.remove("warn");
+});
+$("btnAddExtraModelsDirs")?.addEventListener("click", () => {
+  const p = $("qModelsDir")?.value.trim();
+  if (!p) return;
+  if (!comfyExtraModelsDirs.includes(p)) {
+    comfyExtraModelsDirs.push(p);
+    renderComfyModelsAlsoChips();
+    $("dirsNote").textContent = `Added ${p} as an extra models folder. Click Save folders to persist.`;
+    $("dirsNote").classList.remove("warn");
+  }
+});
+$("qModelsAlsoChips")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-remove-also]");
+  if (!btn) return;
+  const idx = Number(btn.dataset.removeAlso);
+  if (Number.isInteger(idx) && idx >= 0 && idx < comfyExtraModelsDirs.length) {
+    comfyExtraModelsDirs.splice(idx, 1);
+    renderComfyModelsAlsoChips();
+  }
+});
+$("btnScanLanDirs")?.addEventListener("click", async () => {
+  const btn = $("btnScanLanDirs");
+  btn.disabled = true;
+  $("dirsNote").textContent = "Scanning local network (LAN) for ComfyUI servers on port 8188…";
+  $("dirsNote").classList.remove("warn");
+  try {
+    const r = await (await fetch("/api/comfy-source", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "scan-network", subnet: $("qComfyUrl")?.value.trim() }),
+    })).json();
+    if (!r.ok) {
+      $("dirsNote").textContent = r.error || "Network scan failed.";
+      $("dirsNote").classList.add("warn");
+      return;
+    }
+    const existing = new Map((comfyPresetsCache.headlessServers || []).map((s) => [s.url, s]));
+    for (const srv of (r.servers || [])) existing.set(srv.url, srv);
+    renderComfyDiscoveryControls({ headlessServers: [...existing.values()] });
+    if (r.servers?.length) {
+      if ($("qComfyUrl") && !$("qComfyUrl").value.trim()) $("qComfyUrl").value = r.servers[0].url;
+      if ($("qComfyMode")) $("qComfyMode").value = "headless";
+      $("dirsNote").textContent = `Found ${r.servers.length} active ComfyUI server(s) on your network. Select one from the dropdown.`;
+    } else {
+      $("dirsNote").textContent = "No running ComfyUI servers responded on port 8188. Type the IP:port directly if using a custom port.";
+    }
+  } catch (e) {
+    $("dirsNote").textContent = e.message || "Network scan failed.";
+    $("dirsNote").classList.add("warn");
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("btnScanRemoteModelsDirs")?.addEventListener("click", async () => {
+  const btn = $("btnScanRemoteModelsDirs");
+  const url = $("qComfyUrl")?.value.trim();
+  if (!url) {
+    $("dirsNote").textContent = "Enter or select a Network / Headless ComfyUI URL first.";
+    $("dirsNote").classList.add("warn");
+    return;
+  }
+  btn.disabled = true;
+  $("dirsNote").textContent = `Querying models on ${url}…`;
+  $("dirsNote").classList.remove("warn");
+  try {
+    const r = await (await fetch("/api/comfy-source", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "scan-remote-models", comfyUrl: url }),
+    })).json();
+    if (!r.ok) {
+      $("dirsNote").textContent = r.error || "Remote model scan failed.";
+      $("dirsNote").classList.add("warn");
+      return;
+    }
+    if ($("qComfyUrl") && r.url) $("qComfyUrl").value = r.url;
+    const summaryEl = $("qRemoteModelsSummary");
+    if (summaryEl) {
+      const shelves = Object.entries(r.shelves || {}).map(([k, list]) => `${k}: ${list.length}`).join(" · ");
+      summaryEl.hidden = false;
+      summaryEl.textContent = `Remote server (${r.url}) has ${r.totalModels || 0} model files (${shelves || "no shelves reported"}).`;
+    }
+    $("dirsNote").textContent = `Scanned ${r.url}: ${r.totalModels || 0} model files available on remote server.`;
+  } catch (e) {
+    $("dirsNote").textContent = e.message || "Remote model scan failed.";
+    $("dirsNote").classList.add("warn");
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("btnScanFolderDirs")?.addEventListener("click", async () => {
+  const btn = $("btnScanFolderDirs");
+  const scanPath = $("qScanFolderInput")?.value.trim() || $("qRigDir")?.value.trim() || $("qModelsDir")?.value.trim();
+  if (!scanPath) {
+    $("dirsNote").textContent = "Type a folder, drive, or network mount path to scan.";
+    $("dirsNote").classList.add("warn");
+    return;
+  }
+  btn.disabled = true;
+  $("dirsNote").textContent = `Scanning ${scanPath} for ComfyUI installs and model files…`;
+  $("dirsNote").classList.remove("warn");
+  try {
+    const r = await (await fetch("/api/comfy-source", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "scan-folder", path: scanPath }),
+    })).json();
+    if (!r.ok) {
+      $("dirsNote").textContent = r.error || "Folder scan failed.";
+      $("dirsNote").classList.add("warn");
+      return;
+    }
+    const installs = new Map((comfyPresetsCache.regularInstalls || []).map((i) => [i.rig, i]));
+    for (const i of (r.regularInstalls || [])) installs.set(i.rig, i);
+    const models = new Map((comfyPresetsCache.modelFolders || []).map((m) => [m.path, m]));
+    for (const m of (r.modelFolders || [])) models.set(m.path, m);
+    renderComfyDiscoveryControls({
+      regularInstalls: [...installs.values()],
+      modelFolders: [...models.values()],
+    });
+    if (r.regularInstalls?.length) {
+      const first = r.regularInstalls[0];
+      if ($("qRigDir")) $("qRigDir").value = first.rig;
+      if (first.python && $("qComfyPython")) $("qComfyPython").value = first.python;
+      if (first.modelsDir && $("qModelsDir")) $("qModelsDir").value = first.modelsDir;
+      if (first.outputDir && $("qOutDir")) $("qOutDir").value = first.outputDir;
+    } else if (r.modelFolders?.length && $("qModelsDir")) {
+      $("qModelsDir").value = r.modelFolders[0].path;
+    }
+    $("dirsNote").textContent = `Scan complete: found ${(r.regularInstalls || []).length} ComfyUI install(s) and ${(r.modelFolders || []).length} model folder(s) under ${r.scannedPath}.`;
+  } catch (e) {
+    $("dirsNote").textContent = e.message || "Folder scan failed.";
+    $("dirsNote").classList.add("warn");
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("btnAutoScanDirs")?.addEventListener("click", async () => {
+  const btn = $("btnAutoScanDirs");
+  btn.disabled = true;
+  $("dirsNote").textContent = "Scanning common OS directories and mounted drives…";
+  $("dirsNote").classList.remove("warn");
+  try {
+    await loadComfyPresets();
+    $("dirsNote").textContent = `Found ${comfyPresetsCache.regularInstalls.length} ComfyUI install(s) and ${comfyPresetsCache.modelFolders.length} model folder(s). Select from the dropdowns above.`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("comfyPresetBox")?.addEventListener("click", (e) => {
+  const rigBtn = e.target.closest("[data-fill-rig]");
+  if (rigBtn) {
+    if ($("qComfyMode")) $("qComfyMode").value = "regular";
+    $("qRigDir").value = rigBtn.dataset.fillRig;
+    if (rigBtn.dataset.fillPy && $("qComfyPython")) $("qComfyPython").value = rigBtn.dataset.fillPy;
+    if (rigBtn.dataset.fillModels && $("qModelsDir")) $("qModelsDir").value = rigBtn.dataset.fillModels;
+    if (rigBtn.dataset.fillOut && $("qOutDir")) $("qOutDir").value = rigBtn.dataset.fillOut;
+    $("dirsNote").textContent = `Populated Regular ComfyUI install (${rigBtn.dataset.fillRig}). Click Save folders to persist.`;
+    $("dirsNote").classList.remove("warn");
+    return;
+  }
+  const fillBtn = e.target.closest("[data-fill-target]");
+  if (fillBtn) {
+    const el = $(fillBtn.dataset.fillTarget);
+    if (el) el.value = fillBtn.dataset.fillVal;
+    if (fillBtn.dataset.fillMode && $("qComfyMode")) $("qComfyMode").value = fillBtn.dataset.fillMode;
+    $("dirsNote").textContent = `Populated ${fillBtn.dataset.fillVal}. Click Save folders to persist.`;
+    $("dirsNote").classList.remove("warn");
+  }
+});
 $("qLyrics").onchange = async () => {
   await fetch("/api/lyrics", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -19377,15 +19712,17 @@ $("imgEngine").onchange = async () => {
         || '<option value="">no Anima model in models/diffusion_models</option>';
     } catch { /* leave empty */ }
   }
-  if (eng === "checkpoint" && !$("imgCkpt").options.length) {
-    try {
-      const d = await (await fetch("/api/checkpoints")).json();
-      imgCkptShelf = d.checkpoints || [];
-      $("imgCkpt").innerHTML = ckptOptions(imgCkptShelf)
-        || '<option value="">nothing in models/checkpoints or models/diffusion_models yet</option>';
-      imgApplyArch();
-      imgPartsShape();
-    } catch { /* leave empty */ }
+  if (eng === "checkpoint") {
+    if (!$("imgCkpt").options.length) {
+      try {
+        const d = await (await fetch("/api/checkpoints")).json();
+        imgCkptShelf = d.checkpoints || [];
+        $("imgCkpt").innerHTML = ckptOptions(imgCkptShelf)
+          || '<option value="">nothing in models/checkpoints or models/diffusion_models yet</option>';
+      } catch { /* leave empty */ }
+    }
+    if (typeof imgApplyArch === "function") imgApplyArch();
+    if (typeof imgPartsShape === "function") imgPartsShape();
   }
 };
 /* Run it once, now, for whatever the dropdown starts on. The handler is the
@@ -19393,6 +19730,18 @@ $("imgEngine").onchange = async () => {
  * Images screen opens with an empty description and another engine's steps no
  * matter which engine is selected. */
 $("imgEngine").onchange();
+if (!$("imgCkpt").options.length) {
+  fetch("/api/checkpoints").then((r) => r.json()).then((d) => {
+    if ($("imgCkpt").options.length) return;
+    imgCkptShelf = d.checkpoints || [];
+    $("imgCkpt").innerHTML = ckptOptions(imgCkptShelf)
+      || '<option value="">nothing in models/checkpoints or models/diffusion_models yet</option>';
+    if ($("imgEngine").value === "checkpoint") {
+      if (typeof imgApplyArch === "function") imgApplyArch();
+      if (typeof imgPartsShape === "function") imgPartsShape();
+    }
+  }).catch(() => {});
+}
 
 /* One renderer for both checkpoint pickers. A file that cannot load is shown
  * and DISABLED with the reason, rather than hidden: hiding it makes the app
@@ -22392,6 +22741,13 @@ function applyStatus(s) {
     state.pathsPainted = true;
     $("qOutDir").value = s.config.paths.outputDir || "";
     $("qRigDir").value = s.config.paths.rig || "";
+    if ($("qModelsDir")) $("qModelsDir").value = s.config.paths.modelsDir || "";
+    if ($("qComfyPython") && s.config.paths.python && s.config.paths.python !== "headless") {
+      $("qComfyPython").value = s.config.paths.python;
+    }
+    if ($("qComfyMode")) $("qComfyMode").value = s.config.paths.comfyMode || "regular";
+    if ($("qComfyUrl")) $("qComfyUrl").value = s.config.paths.comfyUrl || "";
+    void loadComfyPresets();
   }
   if (s.config?.video && !state.videoPainted) {
     state.videoPainted = true;

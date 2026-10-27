@@ -294,3 +294,28 @@ test('the real v0.8.1 line order (plan_ms before ar.init_ms) still walks every p
   assert.deepEqual(Object.keys(result.record.phaseSeconds||{}).sort(),[...GGUF_PHASES].sort(),'every phase recorded, so the ETA learns');
   assert.equal(result.record.phaseSeconds.plan,0);
 });
+
+test('the official Linux Vulkan runtime manifest validates and yueGgufStatus accepts all upstream YuE2 GGUF byte revisions and POSIX audiocpp_cli',async()=>{
+  const {yueGgufStatus}=await import('./yue-gguf.js');
+  const m=validateRuntimeManifest(JSON.parse(await readFile(path.join(HERE,RUNTIME_KINDS.linux_vulkan.manifest),'utf8')));
+  assert.equal(m.platform,'linux');assert.equal(m.kind,'vulkan');
+  assert.equal(m.archives[0].name,'audio-v0.8.1-bin-ubuntu-x64-vulkan.tar.gz');
+  assert.equal(m.archives[0].bytes,73289490);
+  assert.equal(m.archives[0].sha256,'54070c724b663e3387c750498eba1a152eba9ad711aa247fd9d8addc1a73de02');
+  assert.equal(runtimeKindFor({vendor:'amd',platform:'linux'}),'linux_vulkan');
+  assert.equal(runtimeKindFor({vendor:'intel',platform:'linux'}),'linux_vulkan');
+
+  for(const q4Bytes of [2665632320, 2665645728, 2665641504]) {
+    const settings={enabled:true,cli:path.join(root,'audiocpp_cli.exe'),modelDir:path.join(root,'models'),threads:8};
+    const statFn=async(file)=>{
+      if(file===path.join(root,'audiocpp_cli')) return {isFile:()=>true,size:82750376};
+      if(file===settings.cli) return {isFile:()=>process.platform==='win32',size:process.platform==='win32'?100:0};
+      const f=YUE_GGUF_FILES.find(x=>path.join(settings.modelDir,x.name)===file);
+      if(!f) throw Object.assign(new Error('nope'),{code:'ENOENT'});
+      return {isFile:()=>true,size:f.name==='yue2-3b-q4_0.gguf'?q4Bytes:f.declaredBytes};
+    };
+    const st=await yueGgufStatus({settings,statFn});
+    assert.equal(st.installed,true,`revision byte size ${q4Bytes} should be accepted`);
+  }
+});
+

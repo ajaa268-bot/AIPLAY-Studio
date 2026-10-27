@@ -36,7 +36,8 @@ import os from "node:os";
 import {
   MODEL_FOLDERS, folderGroup, shelfOf, samePath, uniqueDirs,
   extraBases, scanBases, scanBasesSync, findShelfModel, modelName, resolveGraphModels,
-  countByFolder, writeModelPathsYaml, applyModelOverrides,
+  countByFolder, writeModelPathsYaml, applyModelOverrides, pickFolderDialog,
+  discoverComfyPresets, scanPathForComfyAssets, resolveComfyDirPath, detectComfyPython,
 } from "./localmodels.js";
 
 let pass = 0;
@@ -161,6 +162,14 @@ const base = path.join(tmp, "models");
   ok("an explicit path disambiguates", findShelfModel(duplicates, "checkpoints", "other/deep.safetensors")?.bytes === 5);
   await writeFile(path.join(base, "checkpoints", "deep.safetensors"), "top");
   ok("top-level file takes precedence over nested duplicates", findShelfModel(await scanBases([base]), "checkpoints", "deep.safetensors")?.bytes === 3);
+  const secondBase = path.join(tmp, "models-second");
+  await mkdir(path.join(secondBase, "checkpoints"), { recursive: true });
+  await writeFile(path.join(secondBase, "checkpoints", "yue2_3b_bf16.safetensors"), "y".repeat(999));
+  const multiScanned = await scanBases([base, secondBase]);
+  const multiSync = scanBasesSync([base, secondBase]);
+  ok("configured bases deduplicate identical shelf paths in priority order",
+    findShelfModel(multiScanned, "checkpoints", "yue2_3b_bf16.safetensors")?.base === base
+    && findShelfModel(multiSync, "checkpoints", "yue2_3b_bf16.safetensors")?.base === base);
 }
 
 /* ── the YAML that makes ComfyUI look there ────────────────────────────── */
@@ -227,6 +236,51 @@ const base = path.join(tmp, "models");
   ok("a bridge override uses the selected nested file", bridges[1].inputs.adapter === path.join("h3", "chosen.safetensors"));
   ok("bridge overrides leave unrelated adapter fields unchanged", bridges[2].inputs.adapter === "bridge.safetensors");
   ok("a non-graph is handed back unchanged", applyModelOverrides(null, overrides) === null);
+}
+
+/* ── Linux native folder picker (zenity / kdialog) ─────────────────────── */
+{
+  const headless = await pickFolderDialog("/models", "Pick folder", { platform: "linux", env: {} });
+  ok("headless Linux returns unsupported", headless.unsupported === true);
+  const pickedZenity = await pickFolderDialog("/models", "Pick folder", {
+    platform: "linux",
+    env: { DISPLAY: ":0" },
+    execFileFn: (cmd, _args, _opts, cb) => cb(null, "/mnt/shares/models\n"),
+  });
+  ok("Linux desktop session picks folder via zenity", pickedZenity.path === "/mnt/shares/models");
+  const pickedKdialog = await pickFolderDialog("/models", "Pick folder", {
+    platform: "linux",
+    env: { WAYLAND_DISPLAY: "wayland-0" },
+    execFileFn: (cmd, _args, _opts, cb) => {
+      if (cmd === "zenity") return cb(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+      cb(null, "/mnt/shares/kde-models\n");
+    },
+  });
+  ok("Linux desktop falls back from zenity to kdialog", pickedKdialog.path === "/mnt/shares/kde-models");
+}
+
+/* ── ComfyUI auto-discovery and universal directory scanning ─────────────── */
+{
+  const fakeRig = path.join(tmp, "my-comfy");
+  await mkdir(path.join(fakeRig, ".venv", "bin"), { recursive: true });
+  await mkdir(path.join(fakeRig, "models", "checkpoints"), { recursive: true });
+  await writeFile(path.join(fakeRig, "main.py"), "# comfy main");
+  await writeFile(path.join(fakeRig, "nodes.py"), "# comfy nodes");
+  await writeFile(path.join(fakeRig, ".venv", "bin", "python"), "#!/bin/sh");
+  await writeFile(path.join(fakeRig, "models", "checkpoints", "test.safetensors"), "weights");
+  ok("resolveComfyDirPath resolves direct main.py folder", resolveComfyDirPath(fakeRig) === fakeRig);
+  ok("detectComfyPython detects .venv/bin/python", detectComfyPython(fakeRig) === path.join(fakeRig, ".venv", "bin", "python"));
+  const presets = discoverComfyPresets({ rig: fakeRig, comfyMode: "headless", comfyUrl: "http://10.0.0.42:8188" });
+  ok("discoverComfyPresets populates regularInstalls and headlessServers",
+    presets.comfyMode === "headless"
+    && presets.comfyUrl === "http://10.0.0.42:8188"
+    && presets.presets.regularInstalls.some((r) => r.comfyDir === fakeRig)
+    && presets.presets.headlessServers.some((s) => s.url === "http://10.0.0.42:8188"));
+  const scanned = scanPathForComfyAssets(tmp, { maxDepth: 2 });
+  ok("scanPathForComfyAssets finds ComfyUI install, venv, and models folder",
+    scanned.ok === true
+    && scanned.regularInstalls.some((r) => r.comfyDir === fakeRig)
+    && scanned.modelFolders.some((m) => m.path === path.join(fakeRig, "models") && m.files === 1));
 }
 
 } finally {

@@ -86,6 +86,7 @@ const EXPOSURE = {
   ephemeral: "Hidden port: nothing can render without being recorded here.",
   pinned: "AIPLAY_COMFY_PORT is set, so other programs can render here without being recorded.",
   revealed: "The port was revealed this session (logged). Renders sent straight to it are not recorded.",
+  headless: "Connected to an external headless ComfyUI server URL.",
 };
 
 async function loadStatus() {

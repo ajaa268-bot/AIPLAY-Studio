@@ -13,7 +13,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { pickAdapter, fromAdapters, readAmdSysfs } from "./gpu.js";
+import { pickAdapter, fromAdapters, fromSmiOutput, readAmdSysfs, readIntelSysfs } from "./gpu.js";
 
 const src = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
@@ -58,8 +58,39 @@ test("amdgpu on Linux: the numbers in its own files", async () => {
     assert.deepEqual({ name: r.name, totalMb: r.totalMb, usedMb: r.usedMb, utilPct: r.utilPct, vendor: r.vendor },
       { name: "AMD Radeon RX 7900 XTX", totalMb: 16384, usedMb: 3072, utilPct: 41, vendor: "amd" });
     assert.equal(r.source, "amdgpu (sysfs)");
+    await writeFile(path.join(root, "card1", "device", "product_name"), "AMD Radeon RX 9070 XT\n");
+    assert.equal(readAmdSysfs(root).name, "AMD Radeon RX 9070 XT", "reads product_name from sysfs when no name is supplied");
     assert.equal(readAmdSysfs(path.join(root, "missing")), null);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("intel drm (i915 / xe) on Linux: local memory and busy percentage from sysfs", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "aiplay-intel-sysfs-"));
+  try {
+    const dev = path.join(root, "card0", "device");
+    await mkdir(path.join(dev, "tile0", "gt0"), { recursive: true });
+    await writeFile(path.join(dev, "vendor"), "0x8086\n");
+    await writeFile(path.join(dev, "product_name"), "Intel(R) Arc(TM) A770 Graphics\n");
+    await writeFile(path.join(dev, "tile0", "lmem_total_bytes"), `${16 * 1024 * 1048576}\n`);
+    await writeFile(path.join(dev, "tile0", "lmem_avail_bytes"), `${14 * 1024 * 1048576}\n`);
+    await writeFile(path.join(dev, "tile0", "gt0", "gt_busy_percent"), "27\n");
+    const r = readIntelSysfs(root);
+    assert.deepEqual({ name: r.name, totalMb: r.totalMb, usedMb: r.usedMb, utilPct: r.utilPct, vendor: r.vendor },
+      { name: "Intel(R) Arc(TM) A770 Graphics", totalMb: 16384, usedMb: 2048, utilPct: 27, vendor: "intel" });
+    assert.equal(r.source, "intel drm (sysfs)");
+    assert.equal(readIntelSysfs(path.join(root, "missing")), null);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("multi-GPU nvidia-smi output picks the largest VRAM card or named adapter", () => {
+  const smi = "NVIDIA GeForce RTX 3070, 8192, 6339, 0\nNVIDIA GeForce RTX 5070, 12227, 454, 97\n";
+  const picked = fromSmiOutput(smi);
+  assert.deepEqual(
+    { name: picked.name, totalMb: picked.totalMb, usedMb: picked.usedMb, utilPct: picked.utilPct, vendor: picked.vendor },
+    { name: "NVIDIA GeForce RTX 5070", totalMb: 12227, usedMb: 454, utilPct: 97, vendor: "nvidia" },
+  );
+  const named = fromSmiOutput(smi, "RTX 3070");
+  assert.equal(named.name, "NVIDIA GeForce RTX 3070");
 });
 
 test("the gates that refuse a render still read nvidia-smi only", () => {

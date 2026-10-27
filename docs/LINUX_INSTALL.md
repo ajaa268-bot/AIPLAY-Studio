@@ -13,15 +13,26 @@
 4. In the launcher, install the local engine for your graphics card, or connect
    an existing engine. Models are separate downloads, selected in Studio.
 
-The packages target Ubuntu 22.04/24.04 on Intel/AMD x64 and Ubuntu 24.04 on
-ARM64. Compatible Debian-based systems may work but require their own testing.
+The `.deb` packages target Ubuntu 22.04/24.04 on Intel/AMD x64 and Ubuntu 24.04 on
+ARM64. On **Fedora Linux (Fedora 40–45+, RHEL/Rocky/AlmaLinux)**, use the
+portable `.tar.gz` bundle (or clone directly) alongside your native Mesa RADV
+(AMD), Mesa ANV (Intel Arc / Iris Xe) or NVIDIA Vulkan / CUDA drivers.
 The native acceptance workflow tests the actual package, application launch
 and data preservation. It does not certify GPU drivers or generated media.
 
-**Native YuE2 GGUF's automatic runtime installer remains Windows x64 only.**
-On Linux, use a compatible ComfyUI music workflow or supply a compatible native
-CLI yourself. A successful Studio install does not mean every model fits or
-runs on every graphics card. The model's licence still applies.
+**Native YuE2 GGUF (`audio.cpp` v0.8.1+):**
+While the automatic runtime installer defaults to Windows x64, AIPLAY Studio
+also includes a pinned Linux x64 Vulkan runtime manifest
+(`server/music/yue-runtime-manifest-linux-vulkan.json` for official upstream
+`audio-v0.8.1-bin-ubuntu-x64-vulkan.tar.gz`) and automatically detects Linux
+AMD (sysfs `mem_info_vram_total` + `product_name`), Intel Arc / iGPU (`sysfs` +
+`lspci` + `vulkaninfo`), and NVIDIA GPUs (`nvidia-smi` + `vulkaninfo`).
+On Fedora/Ubuntu Linux, place the official `audio.cpp` v0.8.1+ Linux Vulkan
+binary at `~/.aiplay-studio/yue2-gguf/runtime/audiocpp_cli` (or set
+`AIPLAY_AUDIOCPP_CLI`) to run native YuE2 GGUF on AMD, Intel, or NVIDIA GPUs via
+Vulkan or CPU without ComfyUI or Python. A successful Studio install does not
+mean every model fits or runs on every graphics card. The model's licence still
+applies.
 
 ## Updates, repair and removal
 
@@ -66,6 +77,13 @@ terminal command is:
 
 ```sh
 sudo apt install ./AIPLAY-Studio-Linux-amd64.deb
+```
+
+On **Fedora Linux**, install the required system tools and Vulkan/dialog helpers
+with `dnf` and run the portable bundle or repository checkout:
+
+```sh
+sudo dnf install -y vulkan-tools mesa-vulkan-drivers ffmpeg zenity tar
 ```
 
 Use the `arm64` filename on an ARM64 computer. Do not run Studio itself with

@@ -159,15 +159,56 @@ export function readAmdSysfs(root = "/sys/class/drm", name = "") {
   for (const c of cards) {
     const dev = path.join(root, c, "device");
     const num = (f) => { try { return Number(readFileSync(path.join(dev, f), "utf8").trim()); } catch { return NaN; } };
+    const txt = (f) => { try { return readFileSync(path.join(dev, f), "utf8").trim(); } catch { return ""; } };
+    const vendorId = txt("vendor").toLowerCase();
+    if (vendorId && vendorId !== "0x1002") continue;
     const total = num("mem_info_vram_total");
     if (!(total > 0)) continue;
     const used = num("mem_info_vram_used"), busy = num("gpu_busy_percent");
+    const productName = txt("product_name");
     const row = { totalMb: Math.round(total / 1048576), usedMb: used >= 0 ? Math.round(used / 1048576) : null,
-      utilPct: busy >= 0 ? busy : null };
+      utilPct: busy >= 0 ? busy : null, productName };
     if (!best || row.totalMb > best.totalMb) best = row;
   }
   if (!best) return null;
-  return { name: name || "AMD GPU", ...best, vendor: "amd", source: "amdgpu (sysfs)",
+  const { productName, ...metrics } = best;
+  return { name: name || productName || "AMD GPU", ...metrics, vendor: "amd", source: "amdgpu (sysfs)",
+    note: "Driver-reported. PyTorch holds freed blocks, so this reads high." };
+}
+
+/** Intel (i915 / xe) on Linux exposes local memory under sysfs on discrete Arc cards. */
+export function readIntelSysfs(root = "/sys/class/drm", name = "") {
+  if (process.platform !== "linux" && root === "/sys/class/drm") return null;
+  let cards = [];
+  try { cards = readdirSync(root).filter((c) => /^card\d+$/.test(c)); } catch { return null; }
+  let best = null;
+  for (const c of cards) {
+    const dev = path.join(root, c, "device");
+    const num = (f) => { try { return Number(readFileSync(path.join(dev, f), "utf8").trim()); } catch { return NaN; } };
+    const txt = (f) => { try { return readFileSync(path.join(dev, f), "utf8").trim(); } catch { return ""; } };
+    const vendorId = txt("vendor").toLowerCase();
+    if (vendorId && vendorId !== "0x8086") continue;
+    const total = [num("lmem_total_bytes"), num(path.join("tile0", "lmem_total_bytes")), num("mem_info_vram_total")]
+      .find((v) => v > 0);
+    if (!(total > 0)) continue;
+    const avail = [num("lmem_avail_bytes"), num(path.join("tile0", "lmem_avail_bytes"))].find((v) => v >= 0);
+    const vramUsed = num("mem_info_vram_used");
+    const used = Number.isFinite(vramUsed) && vramUsed >= 0 ? vramUsed
+      : Number.isFinite(avail) && avail >= 0 && total >= avail ? total - avail : NaN;
+    const busy = [num("gt_busy_percent"), num(path.join("tile0", "gt0", "gt_busy_percent")), num("gpu_busy_percent")]
+      .find((v) => v >= 0);
+    const productName = txt("product_name");
+    const row = {
+      totalMb: Math.round(total / 1048576),
+      usedMb: Number.isFinite(used) && used >= 0 ? Math.round(used / 1048576) : null,
+      utilPct: Number.isFinite(busy) && busy >= 0 ? busy : null,
+      productName,
+    };
+    if (!best || row.totalMb > best.totalMb) best = row;
+  }
+  if (!best) return null;
+  const { productName, ...metrics } = best;
+  return { name: name || productName || "Intel GPU", ...metrics, vendor: "intel", source: "intel drm (sysfs)",
     note: "Driver-reported. PyTorch holds freed blocks, so this reads high." };
 }
 
@@ -175,10 +216,39 @@ export function readAmdSysfs(root = "/sys/class/drm", name = "") {
 function noSmi() {
   startHelper();
   const want = (engineReading || config.gpu)?.name || "";
-  return fromAdapters(helperReading, want) || readAmdSysfs(undefined, want) || fallback();
+  return fromAdapters(helperReading, want) || readAmdSysfs(undefined, want) || readIntelSysfs(undefined, want) || fallback();
+}
+
+/** Parse CSV lines from `nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu`.
+ *  On multi-GPU workstations (e.g. RTX 3070 8 GB + RTX 5070 12 GB), picks the named card
+ *  or the card with the largest dedicated VRAM via pickAdapter(). */
+export function fromSmiOutput(out = "", wantName = "") {
+  const rows = String(out || "").split(/\r?\n/).filter(Boolean).map((line) => {
+    const [name = "", total = "", used = "", util = ""] = line.split(",").map((s) => s.trim());
+    return {
+      name,
+      totalMb: Number(total),
+      usedMb: used !== "" && Number.isFinite(Number(used)) ? Number(used) : null,
+      utilPct: util !== "" && Number.isFinite(Number(util)) ? Number(util) : null,
+    };
+  });
+  const picked = pickAdapter(rows, wantName);
+  if (!picked) return null;
+  return {
+    ...picked,
+    vendor: "nvidia",
+    source: "nvidia-smi",
+    // Stated plainly so the UI cannot imply more precision than exists.
+    note: "Driver-reported. PyTorch holds freed blocks, so this reads high.",
+  };
 }
 
 function read() {
+  const hUrl = config.comfy?.headlessUrl || config.comfyUrl;
+  const hMode = config.comfy?.mode || config.comfyMode;
+  if (hMode === "headless" && hUrl && !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/i.test(hUrl)) {
+    return Promise.resolve(fallback());
+  }
   if (smiMissing) return Promise.resolve(noSmi());
   return new Promise((resolve) => {
     let out = "";
@@ -193,18 +263,8 @@ function read() {
     proc.on("error", (e) => { if (e?.code === "ENOENT") smiMissing = true; resolve(noSmi()); });
     proc.on("exit", (code) => {
       if (code !== 0) return resolve(noSmi());
-      const [name, total, used, util] = out.split("\n")[0].split(",").map((s) => s.trim());
-      if (!total) return resolve(noSmi());
-      resolve({
-        name,
-        totalMb: Number(total),
-        usedMb: Number(used),
-        utilPct: Number(util),
-        vendor: "nvidia",
-        source: "nvidia-smi",
-        // Stated plainly so the UI cannot imply more precision than exists.
-        note: "Driver-reported. PyTorch holds freed blocks, so this reads high.",
-      });
+      const row = fromSmiOutput(out, (engineReading || config.gpu)?.name || "");
+      resolve(row || noSmi());
     });
   });
 }

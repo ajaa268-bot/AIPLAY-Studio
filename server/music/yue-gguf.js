@@ -114,6 +114,10 @@ const Q8_FILES = Object.freeze([
     declaredSha256: "f3a9e3b197bfd05aa4ae6ab2d4b93f6d57c8cc0ea39a4af7d151f58697c7cfb6" }),
   ...YUE_GGUF_FILES.slice(1),
 ]);
+const ACCEPTED_MODEL_BYTES = Object.freeze({
+  "yue2-3b-q4_0.gguf": Object.freeze([2665632320, 2665645728, 2665641504]),
+  "yue2-3b-q8_0.gguf": Object.freeze([4264186432, 4264199840, 4264195616]),
+});
 export const YUE_GGUF_WEIGHTS = Object.freeze({
   repository: "https://huggingface.co/audio-cpp/Yue2-3B-GGUF",
   revision: "eb116220931de5f373d024d48800338178c7de51",
@@ -210,13 +214,20 @@ export async function yueGgufStatus({ settings = SETTINGS(), statFn = stat, quan
   const variant = ggufVariant(quantization);
   const why = [];
   if (!settings.enabled) why.push("Native YuE2 GGUF is explicitly disabled by AIPLAY_YUE_GGUF_ENABLED=0.");
-  const cli = settings.cli;
+  let cli = settings.cli;
   const nativePath = typeof cli === "string" && path.isAbsolute(cli)
     && !/\.(?:py|js|mjs|cjs|cmd|bat|ps1|sh)$/i.test(cli)
     && (process.platform !== "win32" || /\.exe$/i.test(cli));
   let cliPresent = false;
   if (nativePath) {
     try { const s = await statFn(cli); cliPresent = s.isFile() && s.size > 0; } catch { /* missing */ }
+    if (!cliPresent && process.platform !== "win32" && /\.exe$/i.test(cli)) {
+      const posixCli = cli.replace(/\.exe$/i, "");
+      try {
+        const s = await statFn(posixCli);
+        if (s.isFile() && s.size > 0) { cli = posixCli; cliPresent = true; }
+      } catch { /* missing */ }
+    }
   }
   if (!cliPresent) why.push("Configure an absolute path to an installed native audio.cpp CLI executable; no PATH or Python fallback is used.");
   if (!Number.isInteger(settings.threads) || settings.threads < 1 || settings.threads > 64) why.push("Native threads must be an integer from 1 to 64.");
@@ -226,7 +237,8 @@ export async function yueGgufStatus({ settings = SETTINGS(), statFn = stat, quan
   const weights = await Promise.all(ggufFilesFor(quantization).map(async (file) => {
     const dest = modelDir ? path.join(modelDir, file.name) : null;
     let bytes = 0, present = false;
-    try { if (dest) { const s = await statFn(dest); bytes = s.size; present = s.isFile() && bytes === file.declaredBytes; } } catch { /* missing */ }
+    const validSizes = ACCEPTED_MODEL_BYTES[file.name] || [file.declaredBytes];
+    try { if (dest) { const s = await statFn(dest); bytes = s.size; present = s.isFile() && validSizes.includes(bytes); } } catch { /* missing */ }
     if (!present) why.push(`Missing or incomplete native YuE2 file: ${file.name}.`);
     return { ...file, ...YUE_GGUF_WEIGHTS, dest, bytes, present, hashVerified: false };
   }));
@@ -545,13 +557,13 @@ export async function renderGgufSong(request = {}, { runner = runGgufDriver, pro
   const runId = `${Date.now().toString(36)}${randomBytes(6).toString("hex")}`;
   const parent = path.resolve(r.out), dir = path.join(parent, `gguf-${runId}`);
   const output = path.join(dir, `${r.id}.wav`), abcFile = r.abc ? path.join(dir, "melody.abc") : null;
-  const rt = await runtimeInfo(settings.cli);
+  const rt = await runtimeInfo(status.cli);
   checkAbort(r.signal);
   const backend = pickBackend(rt.backends, { vendor: settings.vendor, preferred: settings.backend });
-  const args = buildGgufArgs(r, { ...settings, output, abcFile, backend, cfgKey: rt.cfgKey });
+  const args = buildGgufArgs(r, { ...settings, cli: status.cli, output, abcFile, backend, cfgKey: rt.cfgKey });
   const actor = normalizeActor(r.actor ?? "system"), via = r.via ?? "music.yue-gguf";
   const record = { runId, actor, via, appVersion: TOOL, model: YUE_GGUF_MODEL, models: [YUE_GGUF_MODEL],
-    project: r.project ?? null, subject: r.subject ?? null, runtime: { ...YUE_GGUF_RUNTIME, backend, version: rt.version, cli: settings.cli, threads: settings.threads },
+    project: r.project ?? null, subject: r.subject ?? null, runtime: { ...YUE_GGUF_RUNTIME, backend, version: rt.version, cli: status.cli, threads: settings.threads },
     weights: status.weights, quantization: r.quantization, modelFile: status.modelFile,
     outputRights: rightsStampFor(YUE_GGUF_MODEL), rights: rightsForRecord(ggufRights()), dir, generationLimits,
     args: { style: r.style, lyricsChars: r.lyrics.length, lyricsSha256: digestText(r.lyrics), cot: r.cot,
@@ -614,7 +626,7 @@ export async function renderGgufSong(request = {}, { runner = runGgufDriver, pro
   try {
     checkAbort(r.signal);
     try {
-      await runner(args, { cli: settings.cli, cwd: dir, signal: r.signal, timeoutMs: r.timeoutMs, onStdout,
+      await runner(args, { cli: status.cli, cwd: dir, signal: r.signal, timeoutMs: r.timeoutMs, onStdout,
         ...(spawnFn ? { spawnFn } : {}), ...(killTree ? { killTree } : {}) });
     } finally { clearInterval(ticker); }
     if (phase === "decode" && !Number.isFinite(phases.decode)) phases.decode = (Date.now() - phaseAt) / 1000;

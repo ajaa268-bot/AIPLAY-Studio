@@ -53,6 +53,45 @@ const CLOUD_ONLY = !MUSIC_ONLY && process.env.AIPLAY_CLOUD_ONLY === "1";
 const REMOTE_ONLY = !MUSIC_ONLY && !CLOUD_ONLY && process.env.AIPLAY_REMOTE_ONLY === "1";
 const RIG = process.env.AIPLAY_RIG || saved.rig
   || (MUSIC_ONLY ? path.join(APPDATA, "rig") : "D:\\AI\\aiplay-studio-bench");
+
+/**
+ * Resolve the ComfyUI directory for a local install: supports both the
+ * parent-folder layout (`<rig>/ComfyUI/main.py`) and a direct ComfyUI folder
+ * (`<rig>/main.py`, e.g. `/opt/comfyui` or `/mnt/shares/comfyui_1`).
+ */
+export function resolveComfyDir(rig) {
+  if (!rig) return "";
+  try {
+    if (fs.existsSync(path.join(rig, "ComfyUI", "main.py"))) return path.join(rig, "ComfyUI");
+    if (fs.existsSync(path.join(rig, "main.py"))) return rig;
+  } catch { /* fall back to standard layout */ }
+  return path.join(rig, "ComfyUI");
+}
+
+/**
+ * Normalize an external / headless ComfyUI HTTP(S) base URL (e.g.
+ * `http://127.0.0.1:8188` or `http://gpu-server.local:8188`). Returns null when
+ * unset or invalid.
+ */
+export function normalizeHeadlessUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const withScheme = /^https?:\/\//i.test(s) ? s : `http://${s}`;
+  try {
+    const u = new URL(withScheme);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+const HEADLESS_URL = normalizeHeadlessUrl(
+  process.env.AIPLAY_COMFY_URL
+  || (saved.comfyMode === "headless" && typeof saved.comfyUrl === "string" ? saved.comfyUrl : ""),
+);
+const COMFY_MODE = HEADLESS_URL ? "headless" : "regular";
+
 /* Where model weights live. A ComfyUI Desktop install keeps them outside the
  * rig (its extra_model_paths default), so this can be PINNED, by env or by
  * settings. Unpinned, it is the rig's own models folder — and `config.modelsDir`
@@ -62,7 +101,7 @@ const RIG = process.env.AIPLAY_RIG || saved.rig
  * Frozen, videoReady() kept finding this machine's real H3 weights under a rig
  * the test had emptied, and that lane passed only on machines without them. */
 const MODELS_DIR_PINNED = process.env.AIPLAY_MODELS_DIR || saved.modelsDir || null;
-const MODELS_DIR = MODELS_DIR_PINNED || path.join(RIG, "ComfyUI", "models");
+const MODELS_DIR = MODELS_DIR_PINNED || path.join(resolveComfyDir(RIG), "models");
 /* The extra models folders (settings `modelsAlso`): one left behind by "Use this
  * folder", or one added with "Add as extra". The engine loads from all of them
  * (localmodels.js writes them into its YAML), so a file in any of them is on disk. */
@@ -260,6 +299,11 @@ function detectPython(rig) {
     ["python_embeded", "python.exe"],    // the portable Windows build
     [".venv", "Scripts", "python.exe"],  // uv / poetry habits
     ["venv", "bin", "python"],           // from source, Linux and macOS
+    [".venv", "bin", "python"],          // uv / venv inside direct ComfyUI folder
+    ["ComfyUI", ".venv", "Scripts", "python.exe"],
+    ["ComfyUI", ".venv", "bin", "python"],
+    ["ComfyUI", "venv", "Scripts", "python.exe"],
+    ["ComfyUI", "venv", "bin", "python"],
   ];
   for (const rel of candidates) {
     const full = path.join(rig, ...rel);
@@ -407,8 +451,8 @@ export const config = {
   },
   /* Graphics-memory tier, remembered across restarts. "auto" detects. */
   tier: "auto",
-  comfyDir: path.join(RIG, "ComfyUI"),
-  get modelsDir() { return MODELS_DIR_PINNED || path.join(this.rig, "ComfyUI", "models"); },
+  comfyDir: resolveComfyDir(RIG),
+  get modelsDir() { return MODELS_DIR_PINNED || path.join(resolveComfyDir(this.rig), "models"); },
   /* Folders the models folder USED to be. Choosing a new folder on the Models
    * screen (a bigger drive, say) sends new downloads there; the weights already
    * downloaded stay where they are, so the old folder is remembered here and
@@ -473,18 +517,25 @@ export const config = {
   outputDir: process.env.AIPLAY_OUTPUT || saved.outputDir
     /* Comfy API mode with no ComfyUI set up keeps its results in app data,
      * like music-only; with one, beside everything else Studio made. */
-    || (MUSIC_ONLY || ((CLOUD_ONLY || REMOTE_ONLY) && !process.env.AIPLAY_RIG && !saved.rig)
-      ? path.join(APPDATA, "output") : path.join(RIG, "ComfyUI", "output")),
+    || (MUSIC_ONLY || ((CLOUD_ONLY || REMOTE_ONLY || COMFY_MODE === "headless") && !process.env.AIPLAY_RIG && !saved.rig)
+      ? path.join(APPDATA, "output") : path.join(resolveComfyDir(RIG), "output")),
   settingsFile: SETTINGS_FILE,
+  comfyMode: COMFY_MODE,
+  comfyUrl: HEADLESS_URL,
   // Where `LoadLatent` looks. Its `latent` input is a name RELATIVE to this, so
   // the encoder writes here and the graph refers to the basename only.
   // A folder chosen in the launcher's Advanced settings, else ComfyUI's own.
-  inputDir: process.env.AIPLAY_INPUT || saved.inputDir || path.join(RIG, "ComfyUI", "input"),
+  inputDir: process.env.AIPLAY_INPUT || saved.inputDir
+    || ((COMFY_MODE === "headless" && !process.env.AIPLAY_RIG && !saved.rig)
+      ? path.join(APPDATA, "input") : path.join(resolveComfyDir(RIG), "input")),
 
   // ONE long-lived ComfyUI process. This is architectural, not a preference:
   // restarting per job discards the AR-stage cache, and with it the ~40% saving
   // that makes re-rolling a mix faster than realtime.
   comfy: {
+    // "regular" (Studio spawns local ComfyUI) or "headless" (Studio connects to an external/remote ComfyUI URL).
+    mode: COMFY_MODE,
+    headlessUrl: HEADLESS_URL,
     // A public stable-release lookup after Studio starts; never an automatic install.
     checkUpdatesOnStart: true,
     /**

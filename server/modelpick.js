@@ -195,8 +195,7 @@ export async function listPickable(config = defaultConfig) {
   const seen = new Set();
   const rows = shelf.filter((f) => PICK_FOLDERS.includes(f.folder) && WEIGHT_RE.test(f.name)
     && !NOT_IMAGE.test(modelLeaf(f.name)) && !seen.has(`${f.folder}/${f.name}`) && seen.add(`${f.folder}/${f.name}`));
-  const out = [];
-  for (const row of rows) {
+  const out = await Promise.all(rows.map(async (row) => {
     /* .ckpt is pickle and .gguf is a container neither probe reads: list them,
      * do not pretend to know them. A .ckpt in models/checkpoints loads as a
      * checkpoint ("unet" here means the SD family); a .gguf in a DiT folder is
@@ -205,8 +204,8 @@ export async function listPickable(config = defaultConfig) {
     const probe = /\.safetensors$/i.test(row.name) ? await probeCached(row.full, row.at)
       : GGUF_RE.test(row.name) ? { bytes: row.bytes, at: row.at, family: familyFromName(row.name), gguf: true }
       : { bytes: row.bytes, at: row.at, family: "unet" };
-    out.push(classify(row, probe));
-  }
+    return classify(row, probe);
+  }));
   out.sort((a, b) => PICK_FOLDERS.indexOf(a.folder) - PICK_FOLDERS.indexOf(b.folder) || (b.at || 0) - (a.at || 0));
   return out;
 }
@@ -321,12 +320,12 @@ export async function listVideoParts(config = defaultConfig) {
     return out;
   };
 
-  const encoders = [];
-  for (const r of parts.encoders) encoders.push({ ...r, fit: await judge(r, "textEncoder") });
-  const vaes = [];
-  for (const r of parts.vaes) {
-    vaes.push({ ...r, fitVideo: await judge(r, "videoVae"), fitAudio: await judge(r, "audioVae") });
-  }
+  const [encoders, vaes] = await Promise.all([
+    Promise.all(parts.encoders.map(async (r) => ({ ...r, fit: await judge(r, "textEncoder") }))),
+    Promise.all(parts.vaes.map(async (r) => ({
+      ...r, fitVideo: await judge(r, "videoVae"), fitAudio: await judge(r, "audioVae"),
+    }))),
+  ]);
   return { encoders, vaes };
 }
 

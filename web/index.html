@@ -5963,17 +5963,65 @@
       <!-- Folders: the only settings that REQUIRE a restart, since the engine
            is launched with them as arguments. -->
       <section class="pcard" id="set-folders" data-nav="Folders">
-        <h3>Folders</h3>
-        <p class="pcard-sub">Where songs are saved and where ComfyUI lives. Takes effect after a restart.</p>
+        <h3>Folders &amp; ComfyUI Connection</h3>
+        <p class="pcard-sub">Point Studio to a Regular local ComfyUI install or a networked / headless ComfyUI server URL, or scan your drives and local network to select your setup.</p>
         <div class="params">
-          <label for="qOutDir">songs go to</label>
-          <span class="pv"><input class="line" id="qOutDir" spellcheck="false"
-            placeholder="…\ComfyUI\output"></span>
+          <label for="qComfyMode">ComfyUI mode</label>
+          <span class="pv">
+            <select id="qComfyMode" class="sel2">
+              <option value="regular">Regular local install (folder + Python venv)</option>
+              <option value="headless">Headless / Networked server (HTTP / WebSocket URL)</option>
+            </select>
+          </span>
+          <label for="qComfyUrl">Network / Headless URL</label>
+          <span class="pv" style="display:grid;gap:6px">
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <input class="line" id="qComfyUrl" spellcheck="false" value="" placeholder="http://127.0.0.1:8188 or 192.168.x.x:8188" style="flex:1;min-width:200px">
+              <button class="btn2" type="button" id="btnScanLanDirs">Scan Network (LAN)</button>
+              <button class="btn2" type="button" id="btnScanRemoteModelsDirs">Scan Server Models</button>
+            </span>
+            <select id="qComfyServerSelect" class="sel2">
+              <option value="">— Select a discovered ComfyUI server —</option>
+            </select>
+            <span class="hint" id="qRemoteModelsSummary" hidden></span>
+          </span>
+          <label for="qScanFolderInput">Scan drive / folder</label>
+          <span class="pv" style="display:flex;gap:6px;flex-wrap:wrap">
+            <input class="line" id="qScanFolderInput" spellcheck="false" value="" placeholder="Type any folder, drive, or network mount to scan for ComfyUI &amp; models…" style="flex:1;min-width:200px">
+            <button class="btn2" type="button" id="btnScanFolderDirs">Scan for Files</button>
+            <button class="btn2" type="button" id="btnAutoScanDirs">Scan Common OS Paths</button>
+          </span>
           <label for="qRigDir">ComfyUI is at</label>
-          <span class="pv"><input class="line" id="qRigDir" spellcheck="false"
-            placeholder="…\aiplay-studio-bench"></span>
+          <span class="pv" style="display:grid;gap:6px">
+            <input class="line" id="qRigDir" spellcheck="false" value="" placeholder="Path to ComfyUI folder (containing main.py)">
+            <select id="qRigSelect" class="sel2">
+              <option value="">— Select a discovered ComfyUI install —</option>
+            </select>
+          </span>
+          <label for="qComfyPython">Python venv</label>
+          <span class="pv"><input class="line" id="qComfyPython" spellcheck="false" value=""
+            placeholder="Auto-detected from ComfyUI folder if left blank"></span>
+          <label for="qModelsDir">models folder</label>
+          <span class="pv" style="display:grid;gap:6px">
+            <span style="display:flex;gap:6px;flex-wrap:wrap">
+              <input class="line" id="qModelsDir" spellcheck="false" value="" placeholder="Path to ComfyUI/models directory" style="flex:1;min-width:200px">
+              <button class="btn2" type="button" id="btnAddExtraModelsDirs" title="Add current path as an extra models folder">+ Add as Extra</button>
+            </span>
+            <select id="qModelsSelect" class="sel2">
+              <option value="">— Select a discovered models folder —</option>
+            </select>
+            <span id="qModelsAlsoChips" style="display:flex;flex-wrap:wrap;gap:6px"></span>
+          </span>
+          <label for="qOutDir">songs go to</label>
+          <span class="pv"><input class="line" id="qOutDir" spellcheck="false" value=""
+            placeholder="Path to ComfyUI/output directory"></span>
+        </div>
+        <div id="comfyPresetBox" style="display:grid;gap:8px;margin:10px 0">
+          <div class="cta" id="comfyUrlPresets" style="flex-wrap:wrap;gap:6px"></div>
+          <div class="cta" id="comfyRigPresets" style="flex-wrap:wrap;gap:6px"></div>
         </div>
         <div class="cta">
+          <button class="btn2" type="button" id="btnTestDirs">Test connection / folder</button>
           <button class="btn2" type="button" id="btnSaveDirs">Save folders</button>
           <span class="hint" id="dirsNote"></span>
         </div>

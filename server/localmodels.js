@@ -16,8 +16,9 @@
  * Nothing here downloads, deletes or moves a file.
  */
 import { readdir, stat, readFile, writeFile, mkdir } from "node:fs/promises";
-import { readdirSync, statSync, readFileSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 
 /** ComfyUI's model folder names, as listed in its own extra_model_paths
@@ -78,9 +79,16 @@ export function findShelfModel(files, folder, name, { fallback = true } = {}) {
   if (!wanted) return null;
   const folders = Array.isArray(folder) ? folder : folderGroup(folder);
   const candidates = files.filter((file) => folders.includes(file.folder));
-  const distinct = (rows) => [...new Map(rows.map((file) => [file.full ? key(file.full) : `${file.folder}/${nameKey(file.name)}`, file])).values()];
+  const distinct = (rows) => [...new Map(rows.map((file) => [
+    file.base && file.bytes && file.at
+      ? `${key(file.base)}:${shelfOf(file.folder)}:${nameKey(file.name)}:${file.bytes}:${file.at}`
+      : (file.full ? key(file.full) : `${file.folder}/${nameKey(file.name)}`),
+    file,
+  ])).values()];
   const exacts = distinct(candidates.filter((file) => nameKey(file.name) === nameKey(wanted)));
   if (exacts.length > 1) {
+    const distinctBases = new Set(exacts.map((f) => f.base && key(f.base)).filter(Boolean));
+    if (exacts.every((f) => f.base) && distinctBases.size === exacts.length) return exacts[0];
     const error = new Error(`${wanted} exists in several configured model folders. Give each copy a distinct relative path or keep one copy.`);
     error.status = 400;
     throw error;
@@ -89,6 +97,9 @@ export function findShelfModel(files, folder, name, { fallback = true } = {}) {
   if (exact || !fallback || wanted !== modelLeaf(wanted)) return exact || null;
   const matches = distinct(candidates.filter((file) => nameKey(modelLeaf(file.name)) === nameKey(wanted)));
   if (matches.length > 1) {
+    const distinctPaths = new Set(matches.map((f) => `${shelfOf(f.folder)}:${nameKey(f.name)}`));
+    const distinctBases = new Set(matches.map((f) => f.base && key(f.base)).filter(Boolean));
+    if (distinctPaths.size === 1 && matches.every((f) => f.base) && distinctBases.size === matches.length) return matches[0];
     const error = new Error(`More than one ${wanted} exists. Choose its subfolder in the model picker.`);
     error.status = 400;
     throw error;
@@ -99,7 +110,8 @@ export function findShelfModel(files, folder, name, { fallback = true } = {}) {
 const WEIGHT_RE = /\.(safetensors|sft|gguf|ckpt|pt|pth|bin)$/i;
 
 const key = (p) => {
-  const r = path.resolve(p);
+  let r = path.resolve(p);
+  try { r = realpathSync(r); } catch { /* virtual or not on disk */ }
   return process.platform === "win32" ? r.toLowerCase() : r;
 };
 export const samePath = (a, b) => key(a) === key(b);
@@ -160,11 +172,29 @@ export const engineBases = async (cfg) => basesOf(cfg, await extraBases(cfg?.com
  * Directory links below a shelf are skipped to avoid cycles; a chosen base
  * or shelf can itself be a linked directory. Empty/partial files are skipped.
  */
+const TMP_PREFIX = path.resolve(os.tmpdir()) + path.sep;
+const baseScanCache = new Map();
+
 export async function scanBases(bases) {
-  const files = [];
+  const files = [], seenShelfRoots = new Set(), seenAcrossBases = new Set(), now = Date.now();
+  const pushBase = (baseFiles) => {
+    for (const f of baseFiles) {
+      if (!seenAcrossBases.has(`${f.shelf}:${nameKey(f.name)}`)) files.push(f);
+    }
+    for (const f of baseFiles) seenAcrossBases.add(`${f.shelf}:${nameKey(f.name)}`);
+  };
   for (const base of uniqueDirs(bases)) {
+    const isTmp = base.startsWith(TMP_PREFIX);
+    if (!isTmp) {
+      const hit = baseScanCache.get(base);
+      if (hit && now - hit.at < 5000) { pushBase(hit.files); continue; }
+    }
+    const baseFiles = [];
     for (const folder of MODEL_FOLDERS) {
-      const root = path.join(base, folder), pending = [root];
+      const root = path.join(base, folder), shelfKey = `${shelfOf(folder)}:${key(root)}`;
+      if (seenShelfRoots.has(shelfKey)) continue;
+      seenShelfRoots.add(shelfKey);
+      const pending = [root];
       while (pending.length) {
         const dir = pending.shift();
         let entries;
@@ -176,10 +206,12 @@ export async function scanBases(bases) {
           if (!e.isFile() || !WEIGHT_RE.test(e.name)) continue;
           const st = await stat(full).catch(() => null);
           if (!st?.isFile() || st.size === 0) continue;
-          files.push({ base, folder, shelf: shelfOf(folder), name: path.relative(root, full), full, bytes: st.size, at: st.mtimeMs });
+          baseFiles.push({ base, folder, shelf: shelfOf(folder), name: path.relative(root, full), full, bytes: st.size, at: st.mtimeMs });
         }
       }
     }
+    if (!isTmp) baseScanCache.set(base, { at: Date.now(), files: baseFiles });
+    pushBase(baseFiles);
   }
   return files;
 }
@@ -188,24 +220,43 @@ export async function scanBases(bases) {
  * rules. No weight bytes are read. Callers reuse a snapshot when checking
  * several slots rather than rescanning it per candidate. */
 export function scanBasesSync(bases) {
-  const files = [];
-  for (const base of uniqueDirs(bases)) for (const folder of MODEL_FOLDERS) {
-    const root = path.join(base, folder), pending = [root];
-    while (pending.length) {
-      const dir = pending.shift();
-      let entries;
-      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-      entries.sort((a, b) => a.name.localeCompare(b.name));
-      for (const e of entries) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) { pending.push(full); continue; }
-        if (!e.isFile() || !WEIGHT_RE.test(e.name)) continue;
-        let st;
-        try { st = statSync(full); } catch { continue; }
-        if (!st.isFile() || st.size === 0) continue;
-        files.push({ base, folder, shelf: shelfOf(folder), name: path.relative(root, full), full, bytes: st.size, at: st.mtimeMs });
+  const files = [], seenShelfRoots = new Set(), seenAcrossBases = new Set(), now = Date.now();
+  const pushBase = (baseFiles) => {
+    for (const f of baseFiles) {
+      if (!seenAcrossBases.has(`${f.shelf}:${nameKey(f.name)}`)) files.push(f);
+    }
+    for (const f of baseFiles) seenAcrossBases.add(`${f.shelf}:${nameKey(f.name)}`);
+  };
+  for (const base of uniqueDirs(bases)) {
+    const isTmp = base.startsWith(TMP_PREFIX);
+    if (!isTmp) {
+      const hit = baseScanCache.get(base);
+      if (hit && now - hit.at < 5000) { pushBase(hit.files); continue; }
+    }
+    const baseFiles = [];
+    for (const folder of MODEL_FOLDERS) {
+      const root = path.join(base, folder), shelfKey = `${shelfOf(folder)}:${key(root)}`;
+      if (seenShelfRoots.has(shelfKey)) continue;
+      seenShelfRoots.add(shelfKey);
+      const pending = [root];
+      while (pending.length) {
+        const dir = pending.shift();
+        let entries;
+        try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+        entries.sort((a, b) => a.name.localeCompare(b.name));
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) { pending.push(full); continue; }
+          if (!e.isFile() || !WEIGHT_RE.test(e.name)) continue;
+          let st;
+          try { st = statSync(full); } catch { continue; }
+          if (!st.isFile() || st.size === 0) continue;
+          baseFiles.push({ base, folder, shelf: shelfOf(folder), name: path.relative(root, full), full, bytes: st.size, at: st.mtimeMs });
+        }
       }
     }
+    if (!isTmp) baseScanCache.set(base, { at: Date.now(), files: baseFiles });
+    pushBase(baseFiles);
   }
   return files;
 }
@@ -307,8 +358,31 @@ export function applyModelOverrides(graph, overrides) {
  */
 export const MODELS_PROMPT =
   "Choose the folder that holds your models (the one containing checkpoints, diffusion_models, vae, ...)";
-export function pickFolderDialog(start = "", description = MODELS_PROMPT) {
-  if (process.platform !== "win32") return Promise.resolve({ unsupported: true });
+export function pickFolderDialog(start = "", description = MODELS_PROMPT, {
+  platform = process.platform, env = process.env, execFileFn = execFile,
+} = {}) {
+  if (platform === "linux" && !env.NODE_TEST_CONTEXT && (env.DISPLAY || env.WAYLAND_DISPLAY)) {
+    const startArg = start ? (start.endsWith("/") ? start : `${start}/`) : "";
+    return new Promise((resolve) => {
+      execFileFn("zenity", [
+        "--file-selection", "--directory",
+        `--title=${description}`,
+        ...(startArg ? [`--filename=${startArg}`] : []),
+      ], { timeout: 10 * 60_000 }, (err, stdout) => {
+        if (!err) return resolve({ path: String(stdout).trim() || null });
+        if (err.code === 1) return resolve({ path: null }); // user cancelled zenity
+        execFileFn("kdialog", [
+          "--getexistingdirectory", start || ".",
+          "--title", description,
+        ], { timeout: 10 * 60_000 }, (kErr, kStdout) => {
+          if (!kErr) return resolve({ path: String(kStdout).trim() || null });
+          if (kErr.code === 1) return resolve({ path: null }); // user cancelled kdialog
+          resolve({ unsupported: true });
+        });
+      });
+    });
+  }
+  if (platform !== "win32") return Promise.resolve({ unsupported: true });
   const lit = (s) => `'${String(s).replace(/'/g, "''")}'`;
   const ps = [
     "[Console]::OutputEncoding=[Text.Encoding]::UTF8",
@@ -321,10 +395,322 @@ export function pickFolderDialog(start = "", description = MODELS_PROMPT) {
     "if($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.SelectedPath)}",
   ].join(";");
   return new Promise((resolve) => {
-    execFile("powershell.exe", ["-NoProfile", "-STA", "-Command", ps],
+    execFileFn("powershell.exe", ["-NoProfile", "-STA", "-Command", ps],
       { timeout: 10 * 60_000, windowsHide: true },
       (err, stdout) => resolve(err
         ? { error: String(err.message || err).split("\n")[0] }
         : { path: String(stdout).trim() || null }));
   });
 }
+
+/** Resolve either a parent folder containing ComfyUI/main.py or a direct main.py folder. */
+export function resolveComfyDirPath(rig) {
+  if (!rig) return "";
+  try {
+    if (existsSync(path.join(rig, "ComfyUI", "main.py"))) return path.join(rig, "ComfyUI");
+    if (existsSync(path.join(rig, "main.py"))) return rig;
+  } catch { /* fall back */ }
+  return path.join(rig, "ComfyUI");
+}
+
+/** Find a Python executable inside a local ComfyUI install or its parent directory. */
+export function detectComfyPython(rig, customPy = null) {
+  if (customPy && customPy !== "headless" && existsSync(customPy)) return customPy;
+  if (!rig) return null;
+  for (const rel of [
+    ["venv", "Scripts", "python.exe"], ["venv", "bin", "python"], ["venv", "bin", "python3"],
+    ["python_embeded", "python.exe"],
+    [".venv", "Scripts", "python.exe"], [".venv", "bin", "python"], [".venv", "bin", "python3"],
+    ["ComfyUI", ".venv", "Scripts", "python.exe"], ["ComfyUI", ".venv", "bin", "python"], ["ComfyUI", ".venv", "bin", "python3"],
+    ["ComfyUI", "venv", "Scripts", "python.exe"], ["ComfyUI", "venv", "bin", "python"], ["ComfyUI", "venv", "bin", "python3"],
+  ]) {
+    const p = path.join(rig, ...rel);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * Universal directory scanner: walks `targetPath` up to `maxDepth` to find
+ * ComfyUI installations (`main.py`), Python virtual environments, and model
+ * directories containing weight files. Works on any OS, drive, or network mount.
+ */
+const SKIP_SCAN_DIRS = new Set([
+  ".git", "node_modules", "__pycache__", ".cache", ".venv", "venv", "python_embeded",
+  "proc", "sys", "dev", "run", "tmp", "var", "etc", "usr", "lib", "lib64", "bin", "sbin",
+  "Windows", "Program Files", "Program Files (x86)", "ProgramData", "$RECYCLE.BIN", "System Volume Information",
+]);
+
+export function scanPathForComfyAssets(targetPath, { maxDepth = 3 } = {}) {
+  const root = String(targetPath || "").trim();
+  if (!root || !existsSync(root)) {
+    return { ok: false, error: `Folder not found: ${root || "(empty)"}` };
+  }
+  const resolvedRoot = path.resolve(root);
+  const regularInstalls = [];
+  const modelFolders = [];
+  const pythonEnvs = [];
+  const seenInstalls = new Set();
+  const seenModels = new Set();
+  const seenPy = new Set();
+
+  const inspectDir = (dir, depth) => {
+    let normDir;
+    try { normDir = key(dir); } catch { return; }
+
+    // 1. Is this a ComfyUI installation?
+    if (existsSync(path.join(dir, "main.py")) && (existsSync(path.join(dir, "nodes.py")) || existsSync(path.join(dir, "comfy")))) {
+      if (!seenInstalls.has(normDir)) {
+        seenInstalls.add(normDir);
+        const py = detectComfyPython(dir, null) || detectComfyPython(path.dirname(dir), null);
+        const mDir = existsSync(path.join(dir, "models")) ? path.join(dir, "models") : null;
+        const oDir = path.join(dir, "output");
+        regularInstalls.push({
+          label: `${path.basename(path.dirname(dir))}/${path.basename(dir)} (${dir})`,
+          rig: dir,
+          parentRig: path.dirname(dir),
+          comfyDir: dir,
+          python: py,
+          modelsDir: mDir,
+          outputDir: oDir,
+        });
+        if (py) {
+          const pyKey = key(py);
+          if (!seenPy.has(pyKey)) {
+            seenPy.add(pyKey);
+            pythonEnvs.push({ path: py, label: `${py}` });
+          }
+        }
+      }
+    }
+
+    // 2. Does this directory have a standalone Python venv?
+    const pyHere = detectComfyPython(dir, null);
+    if (pyHere) {
+      const pyKey = key(pyHere);
+      if (!seenPy.has(pyKey)) {
+        seenPy.add(pyKey);
+        pythonEnvs.push({ path: pyHere, label: `${pyHere}` });
+      }
+    }
+
+    // 3. Is this a ComfyUI models folder (contains standard shelf subfolders)?
+    const hasShelf = ["checkpoints", "diffusion_models", "unet", "vae", "loras", "text_encoders", "clip"]
+      .some((shelf) => existsSync(path.join(dir, shelf)));
+    if (hasShelf && !seenModels.has(normDir)) {
+      seenModels.add(normDir);
+      let fileCount = 0;
+      let totalBytes = 0;
+      try {
+        const scanned = scanBasesSync([dir]);
+        fileCount = scanned.length;
+        totalBytes = scanned.reduce((acc, f) => acc + (f.bytes || 0), 0);
+      } catch { /* ignore */ }
+      if (fileCount > 0 || path.basename(dir).toLowerCase() === "models") {
+        const gb = (totalBytes / 1073741824).toFixed(1);
+        modelFolders.push({
+          path: dir,
+          files: fileCount,
+          bytes: totalBytes,
+          label: fileCount > 0 ? `${dir} (${fileCount} files · ${gb} GB)` : `${dir} (empty models folder)`,
+        });
+      }
+    }
+
+    if (depth >= maxDepth) return;
+    let entries = [];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") && entry.name !== ".aiplay-studio") continue;
+      if (SKIP_SCAN_DIRS.has(entry.name)) continue;
+      const sub = path.join(dir, entry.name);
+      let isDir = entry.isDirectory();
+      if (!isDir && entry.isSymbolicLink()) {
+        try { isDir = statSync(sub).isDirectory(); } catch { isDir = false; }
+      }
+      if (isDir) inspectDir(sub, depth + 1);
+    }
+  };
+
+  inspectDir(resolvedRoot, 0);
+  return {
+    ok: true,
+    scannedPath: resolvedRoot,
+    regularInstalls,
+    modelFolders,
+    pythonEnvs,
+  };
+}
+
+/**
+ * Dynamically discover ComfyUI installations, Python environments, model
+ * directories, output directories, and saved/local headless endpoints on ANY
+ * user's system without hardcoded machine-specific paths or IPs.
+ */
+export function discoverComfyPresets(saved = {}) {
+  const home = os.homedir();
+  const candidateRoots = [
+    saved.rig && !/^https?:\/\//i.test(saved.rig) ? saved.rig : null,
+    path.join(home, "ComfyUI"),
+    path.join(home, "StabilityMatrix", "Packages", "ComfyUI"),
+    path.join(home, "AI"),
+    path.join(home, "aiplay-studio"),
+    path.join(home, ".aiplay-studio", "engine"),
+    ...(Array.isArray(saved.scannedDirs) ? saved.scannedDirs : []),
+  ].filter(Boolean);
+
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData) candidateRoots.push(path.join(localAppData, "Programs", "ComfyUI"));
+    for (const d of "CDEFGHIJKLMNOPQRSTUVWXYZ") {
+      if (!existsSync(`${d}:\\`)) continue;
+      for (const rel of ["ComfyUI", "AI", "StabilityMatrix\\Packages\\ComfyUI", "ComfyUI_windows_portable"]) {
+        const p = `${d}:\\${rel}`;
+        if (existsSync(p)) candidateRoots.push(p);
+      }
+    }
+  } else {
+    for (const sysDir of ["/opt/ComfyUI", "/opt/comfyui"]) {
+      if (existsSync(sysDir)) candidateRoots.push(sysDir);
+    }
+    for (const mountRoot of ["/mnt", "/media", "/run/media", "/Volumes"]) {
+      if (!existsSync(mountRoot)) continue;
+      try {
+        for (const e1 of readdirSync(mountRoot)) {
+          const p1 = path.join(mountRoot, e1);
+          candidateRoots.push(p1);
+          try {
+            for (const e2 of readdirSync(p1)) {
+              candidateRoots.push(path.join(p1, e2));
+            }
+          } catch { /* ignore non-dir or permission */ }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  const seenComfyDirs = new Set();
+  const regularInstalls = [];
+  for (const cand of candidateRoots) {
+    const cDir = resolveComfyDirPath(cand);
+    if (!cDir || !existsSync(path.join(cDir, "main.py"))) continue;
+    const normKey = key(cDir);
+    if (seenComfyDirs.has(normKey)) continue;
+    seenComfyDirs.add(normKey);
+    const py = detectComfyPython(cand, null) || detectComfyPython(cDir, null);
+    const modelsDir = existsSync(path.join(cDir, "models")) ? path.join(cDir, "models") : null;
+    const outputDir = path.join(cDir, "output");
+    regularInstalls.push({
+      label: `${cDir}`,
+      rig: cDir,
+      parentRig: path.dirname(cDir),
+      comfyDir: cDir,
+      python: py,
+      modelsDir,
+      outputDir,
+    });
+  }
+
+  const rawModelDirs = [
+    saved.modelsDir,
+    ...(Array.isArray(saved.modelsAlso) ? saved.modelsAlso : []),
+    ...regularInstalls.map((r) => r.modelsDir),
+    ...candidateRoots.map((c) => path.join(c, "models")),
+    ...candidateRoots.map((c) => path.join(c, "ComfyUI", "models")),
+  ].filter((d) => d && existsSync(d));
+
+  const modelFolders = uniqueDirs(rawModelDirs).map((d) => {
+    let fileCount = 0;
+    let totalBytes = 0;
+    try {
+      const files = scanBasesSync([d]);
+      fileCount = files.length;
+      totalBytes = files.reduce((acc, f) => acc + (f.bytes || 0), 0);
+    } catch { /* ignore */ }
+    const gb = (totalBytes / 1073741824).toFixed(1);
+    return {
+      path: d,
+      files: fileCount,
+      bytes: totalBytes,
+      label: fileCount > 0 ? `${d} (${fileCount} files · ${gb} GB)` : d,
+    };
+  });
+
+  const rawOutDirs = [
+    saved.outputDir,
+    ...regularInstalls.map((r) => r.outputDir),
+    path.join(home, ".aiplay-studio", "output"),
+  ].filter(Boolean);
+  const seenOut = new Set();
+  const outputFolders = [];
+  for (const d of rawOutDirs) {
+    const r = path.resolve(d);
+    if (seenOut.has(r)) continue;
+    seenOut.add(r);
+    outputFolders.push({ path: r, label: r });
+  }
+
+  const pythonEnvs = [];
+  const seenPy = new Set();
+  const pyCandidates = [
+    saved.python && saved.python !== "headless" ? saved.python : null,
+    ...regularInstalls.map((r) => r.python),
+    process.platform === "win32" ? null : "/usr/bin/python3",
+  ].filter((x) => x && existsSync(x));
+  for (const p of pyCandidates) {
+    const r = key(p);
+    if (seenPy.has(r)) continue;
+    seenPy.add(r);
+    pythonEnvs.push({
+      path: p,
+      label: p.includes(".venv") || p.includes("venv") || p.includes("python_embeded")
+        ? `Venv (${p})`
+        : `System Python (${p})`,
+    });
+  }
+
+  const headlessPresets = [];
+  const seenUrls = new Set();
+  const addHeadless = (u, label) => {
+    if (!u || typeof u !== "string") return;
+    const clean = u.trim().replace(/\/+$/, "");
+    if (!clean || seenUrls.has(clean)) return;
+    seenUrls.add(clean);
+    headlessPresets.push({ url: clean, label: label || clean });
+  };
+  if (saved.comfyUrl) addHeadless(saved.comfyUrl, `Saved Server (${saved.comfyUrl})`);
+  if (Array.isArray(saved.headlessHistory)) {
+    for (const h of saved.headlessHistory) addHeadless(h, h);
+  }
+  addHeadless("http://127.0.0.1:8188", "Localhost (http://127.0.0.1:8188)");
+
+  const defaultInstall = regularInstalls[0] || null;
+  const resolvedRig = (saved.rig && !/^https?:\/\//i.test(saved.rig) ? resolveComfyDirPath(saved.rig) : null)
+    || defaultInstall?.comfyDir
+    || "";
+  const resolvedPy = detectComfyPython(saved.rig || resolvedRig, saved.python)
+    || defaultInstall?.python
+    || "";
+  const resolvedModels = saved.modelsDir || defaultInstall?.modelsDir || modelFolders[0]?.path || "";
+  const resolvedOutput = saved.outputDir || defaultInstall?.outputDir || outputFolders[0]?.path || "";
+
+  return {
+    comfyMode: saved.comfyMode === "headless" ? "headless" : "regular",
+    comfyUrl: saved.comfyUrl || "http://127.0.0.1:8188",
+    rig: resolvedRig,
+    comfyDir: resolvedRig ? resolveComfyDirPath(resolvedRig) : "",
+    python: resolvedPy,
+    detectedPython: resolvedPy || null,
+    modelsDir: resolvedModels,
+    modelsAlso: Array.isArray(saved.modelsAlso) ? saved.modelsAlso : [],
+    outputDir: resolvedOutput,
+    presets: {
+      regularInstalls,
+      headlessServers: headlessPresets,
+      modelFolders,
+      outputFolders,
+      pythonEnvs,
+    },
+  };
+}
+

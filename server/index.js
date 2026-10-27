@@ -331,6 +331,7 @@ function missingSupport(cap, ownDit, own = {}) {
 }
 import {
   scanBases, engineBases, uniqueDirs, countByFolder, shelfOf, pickFolderDialog, samePath, requireModelName, modelLeaf, findShelfModel,
+  discoverComfyPresets, scanPathForComfyAssets, resolveComfyDirPath, detectComfyPython,
 } from "./localmodels.js";
 import { readMachine, fitFor, recommendFor, FIT_STATES, defaultFor, yue2BuildFor, yue2ComfyFitOn } from "./fit.js";
 import { h3Status, h3StartSize, H3_VAE_MEASURED } from "./h3tier.js";
@@ -3996,7 +3997,15 @@ const server = http.createServer(async (req, res) => {
           site: config.community.site,
           // Shown in Settings so the folder fields start filled in rather than
           // empty, which would read as "unset" when they are anything but.
-          paths: { outputDir: config.outputDir, rig: config.rig },
+          paths: {
+            outputDir: config.outputDir,
+            rig: config.rig,
+            modelsDir: config.modelsDir,
+            modelsAlso: config.modelsAlso || [],
+            python: config.comfy?.python || "",
+            comfyMode: config.comfy?.mode || config.comfyMode || "regular",
+            comfyUrl: config.comfy?.headlessUrl || config.comfyUrl || "http://127.0.0.1:8188",
+          },
           siteSessions: config.community.sessions,
           output: config.output,
           /* The stems python beside the setting, as Settings > Songs shows it:
@@ -9548,13 +9557,26 @@ const server = http.createServer(async (req, res) => {
        * below and make Studio run, or write to, another machine; it is refused
        * before anything touches it (the mkdir probe would already reach the
        * host). The same rule as the timed lyrics python. */
-      for (const key of ["outputDir", "rig"]) {
+      for (const key of ["outputDir", "rig", "modelsDir", "python"]) {
         if (typeof b[key] !== "string" || !b[key].trim()) continue;
         const raw = b[key].trim();
         if (/^[\\/]{2}/.test(raw)) return json(res, 400, { error: "Choose a folder on this computer's own disk, not a network or device path." });
         if (!path.isAbsolute(raw) || /[\r\n\0]/.test(raw) || raw.length > 1024) return json(res, 400, { error: "Give the full path to the folder, not a relative one." });
       }
       const next = {};
+      if (b.comfyMode === "headless" || b.comfyMode === "regular") {
+        next.comfyMode = b.comfyMode;
+      }
+      if (typeof b.comfyUrl === "string" && b.comfyUrl.trim()) {
+        try {
+          const rawUrl = b.comfyUrl.trim();
+          const u = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `http://${rawUrl}`);
+          if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad scheme");
+          next.comfyUrl = u.origin + (u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "");
+        } catch {
+          return json(res, 400, { error: "Enter a valid HTTP(S) URL for your headless ComfyUI server." });
+        }
+      }
       if (typeof b.outputDir === "string" && b.outputDir.trim()) {
         const dir = path.resolve(b.outputDir.trim());
         try {
@@ -9572,8 +9594,24 @@ const server = http.createServer(async (req, res) => {
       if (typeof b.rig === "string" && b.rig.trim()) {
         const rig = path.resolve(b.rig.trim());
         try { await stat(path.join(rig, "ComfyUI", "main.py")); }
-        catch { return json(res, 400, { error: "That folder does not contain ComfyUI/main.py." }); }
+        catch {
+          try { await stat(path.join(rig, "main.py")); }
+          catch { return json(res, 400, { error: "That folder does not contain ComfyUI/main.py." }); }
+        }
         next.rig = rig;
+      }
+      if (typeof b.modelsDir === "string" && b.modelsDir.trim()) {
+        const mDir = path.resolve(b.modelsDir.trim());
+        try { await stat(mDir); }
+        catch { return json(res, 400, { error: "That models folder does not exist." }); }
+        next.modelsDir = mDir;
+        next.modelsDirPinned = true;
+      }
+      if (typeof b.python === "string" && b.python.trim() && b.python.trim() !== "headless") {
+        const pyPath = path.resolve(b.python.trim());
+        try { await stat(pyPath); }
+        catch { return json(res, 400, { error: "That Python executable does not exist." }); }
+        next.python = pyPath;
       }
       if (!Object.keys(next).length) return json(res, 400, { error: "Nothing to change." });
 
@@ -9588,6 +9626,86 @@ const server = http.createServer(async (req, res) => {
         needsRestart: true,
         note: "Saved. Restart AIPLAY Studio for this to take effect — the engine is launched with the folder as an argument.",
       });
+    }
+
+    if (p === "/api/comfy-source") {
+      let current = {};
+      try { current = JSON.parse(await readFile(config.settingsFile, "utf-8")) || {}; } catch { /* empty */ }
+      if (req.method === "GET") {
+        const disc = discoverComfyPresets(current);
+        const headlessServers = await Promise.all(
+          disc.presets.headlessServers.map(async (srv) => {
+            const pr = await engineDoor.probeHeadlessUrl(srv.url, 1500);
+            return {
+              ...srv,
+              online: !!pr.ok,
+              version: pr.version || null,
+              torch: pr.torch || null,
+              device: pr.device || null,
+              vramMb: pr.vramMb || null,
+            };
+          }),
+        );
+        return json(res, 200, { ...disc, presets: { ...disc.presets, headlessServers } });
+      }
+      if (req.method === "POST") {
+        if (!sameOriginLocalJson(req)) return json(res, 403, { error: "Only accepted from Studio's own page or a local client." });
+        const b = await readBody(req);
+        if (b.action === "test") {
+          if (b.comfyMode === "headless") {
+            return json(res, 200, await engineDoor.probeHeadlessUrl(b.comfyUrl, 3000));
+          }
+          const rawRig = String(b.rig || "").trim();
+          const cDir = resolveComfyDirPath(rawRig);
+          try { await stat(path.join(cDir, "main.py")); }
+          catch { return json(res, 200, { ok: false, error: `No ComfyUI main.py found under ${rawRig || "(empty)"}.` }); }
+          const py = detectComfyPython(rawRig, b.python || null) || detectComfyPython(cDir, b.python || null);
+          if (!py) return json(res, 200, { ok: false, error: `Found ComfyUI at ${cDir}, but no Python venv was found.` });
+          return json(res, 200, { ok: true, rig: cDir, comfyDir: cDir, python: py, note: `Valid Regular ComfyUI install at ${cDir} (Python: ${py}).` });
+        }
+        if (b.action === "scan-network") {
+          const scan = await engineDoor.scanLanComfyServers({ customHost: String(b.customHost || "").trim() });
+          if (scan.ok && scan.servers?.length) {
+            const existing = Array.isArray(current.headlessHistory) ? current.headlessHistory : [];
+            const mergedUrls = [...new Set([...scan.servers.map((s) => s.url), ...existing])].slice(0, 12);
+            await mkdir(path.dirname(config.settingsFile), { recursive: true });
+            await writeFile(config.settingsFile, JSON.stringify({ ...current, headlessHistory: mergedUrls }, null, 2));
+          }
+          return json(res, 200, scan);
+        }
+        if (b.action === "scan-remote-models") {
+          return json(res, 200, await engineDoor.scanRemoteComfyModels(b.comfyUrl, 4500));
+        }
+        if (b.action === "scan-folder") {
+          const resScan = scanPathForComfyAssets(b.scanPath, { maxDepth: 3 });
+          if (resScan.ok && resScan.scannedPath) {
+            const existing = Array.isArray(current.scannedDirs) ? current.scannedDirs : [];
+            const mergedDirs = [...new Set([resScan.scannedPath, ...existing])].slice(0, 12);
+            await mkdir(path.dirname(config.settingsFile), { recursive: true });
+            await writeFile(config.settingsFile, JSON.stringify({ ...current, scannedDirs: mergedDirs }, null, 2));
+          }
+          return json(res, 200, resScan);
+        }
+        if (b.action === "browse") {
+          const target = String(b.target || "scan");
+          const startDir = target === "models" ? (current.modelsDir || "") : target === "output" ? (current.outputDir || "") : (current.rig || "");
+          const r = await pickFolderDialog(startDir, "Choose folder to select or scan");
+          if (r.unsupported) return json(res, 200, { error: "No native GUI folder dialog found; enter the folder path in the text box." });
+          if (r.error) return json(res, 200, { error: r.error });
+          if (!r.path) return json(res, 200, { cancelled: true });
+          return json(res, 200, { ok: true, path: r.path });
+        }
+        if (b.action === "add-models-also") {
+          const extraDir = String(b.modelsDir || "").trim();
+          if (!extraDir) return json(res, 400, { error: "Provide a models folder path." });
+          try { await stat(extraDir); } catch { return json(res, 400, { error: `Folder not found: ${extraDir}` }); }
+          const resolvedExtra = path.resolve(extraDir);
+          const also = uniqueDirs([...(Array.isArray(current.modelsAlso) ? current.modelsAlso : []), resolvedExtra]);
+          await mkdir(path.dirname(config.settingsFile), { recursive: true });
+          await writeFile(config.settingsFile, JSON.stringify({ ...current, modelsAlso: also }, null, 2));
+          return json(res, 200, { ok: true, modelsAlso: also, note: `Added ${resolvedExtra} to extra model folders.` });
+        }
+      }
     }
 
     /**
@@ -10601,11 +10719,14 @@ const server = http.createServer(async (req, res) => {
       const seen = new Set();
       const files = (await scanBases(await modelBases())).filter((f) => isDitFolder(f.folder)
         && /\.safetensors$/i.test(f.name) && !seen.has(f.name) && seen.add(f.name));
-      const rows = [];
-      for (const { name, full, at } of files) {
+      const probed = await Promise.all(files.map(async ({ name, full, at }) => {
         const key = `dit:${full}:${at}`;
         let probe = ckptProbeCache.get(key);
         if (!probe) { probe = await probeModel(full); ckptProbeCache.set(key, probe); }
+        return { name, probe };
+      }));
+      const rows = [];
+      for (const { name, probe } of probed) {
         if (want && String(probe.family).toLowerCase() !== want) continue;
         rows.push({ name, bytes: probe.bytes, at: probe.at, family: probe.family, variant: probe.variant ?? null });
       }
@@ -14170,6 +14291,9 @@ server.listen(config.uiPort, LAN.on ? "0.0.0.0" : "127.0.0.1", async () => {
   for (const d of (await machineDefaults().catch(() => null)) || []) {
     if (d.chosenBy === "machine" || d.savedValue) console.log(`  default: ${d.why}`);
   }
+  /* Pre-warm the checkpoint & model shelves in the background so /api/checkpoints
+   * and /api/videomodels answer immediately when the UI opens. */
+  Promise.all([listPickable(config), listVideoParts(config)]).catch(() => {});
   const vendorNow = () => { const g = gpuStatus(); return g?.totalMb ? (g.vendor || "nvidia") : null; };
   if (config.musicOnly) {
     /* Music-only starts no ComfyUI — unless this machine has a ComfyUI install

@@ -219,9 +219,58 @@
   .modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px;
     background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(3px); }
   .modal .card { width: min(460px, 100%); box-shadow: 0 24px 80px rgba(0, 0, 0, .5); }
+  .modal .card.comfy-card { width: min(560px, 100%); display: grid; gap: 14px; }
   .modal h3 { margin: 0; font: 600 16px var(--disp); }
   .modal p { margin: 0; color: var(--dim); font-size: 13px; line-height: 1.5; }
   .modal .actions { justify-content: flex-end; }
+  .csrc-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .csrc-tab {
+    appearance: none; text-align: left; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--hair); background: var(--raise); color: var(--dim); cursor: pointer;
+    display: grid; gap: 2px;
+  }
+  .csrc-tab b { font: 600 13.5px var(--disp); color: var(--ink); }
+  .csrc-tab small { font-size: 11.5px; color: var(--faint); }
+  .csrc-tab.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--raise)); }
+  .csrc-field { display: grid; gap: 5px; }
+  .csrc-field label { font: 600 12.5px var(--disp); color: var(--ink); }
+  .csrc-field small { font-size: 11.5px; color: var(--faint); }
+  .csrc-row { display: flex; gap: 8px; align-items: center; }
+  .csrc-row input, .csrc-field input {
+    flex: 1; width: 100%; padding: 8px 11px; border-radius: 8px;
+    border: 1px solid var(--hair); background: var(--bg); color: var(--ink);
+    font: 12.5px var(--mono);
+  }
+  .csrc-chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 11.5px; color: var(--faint); }
+  .csrc-chip {
+    appearance: none; border: 1px solid var(--hair); background: var(--raise); color: var(--dim);
+    border-radius: 999px; padding: 3px 10px; font: 11.5px var(--mono); cursor: pointer;
+  }
+  .csrc-chip:hover { border-color: var(--primary); color: var(--primary); }
+  .csrc-status {
+    padding: 9px 12px; border-radius: 8px; font-size: 12.5px; line-height: 1.45;
+    border: 1px solid var(--hair); background: var(--raise); color: var(--dim);
+  }
+  .csrc-status.ok { border-color: color-mix(in srgb, var(--ok) 40%, transparent); color: var(--ok); }
+  .csrc-status.err { border-color: color-mix(in srgb, var(--err) 40%, transparent); color: var(--err); }
+  .csrc-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 12px 16px;
+  }
+  .csrc-bar-info { display: flex; flex-direction: column; gap: 3px; min-width: 240px; flex: 1; }
+  .csrc-bar-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font: 600 13.5px var(--disp); color: var(--ink); }
+  .csrc-badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px;
+    font: 600 10.5px var(--mono); letter-spacing: .04em; text-transform: uppercase;
+    background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary);
+    border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent);
+  }
+  .csrc-bar-sub { font: 11.5px var(--mono); color: var(--faint); overflow-wrap: anywhere; }
+  .csrc-bar-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .csrc-bar-actions .btn { padding: 6px 12px; font-size: 11.5px; }
+  .csrc-chip.active { border-color: var(--primary); color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--raise)); }
+  .csrc-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; background: var(--ghost); vertical-align: middle; }
+  .csrc-dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
   .runbadge i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
   .mode.active.starting .runbadge { color: var(--primary); }
   .mode.active.starting .runbadge i { background: var(--primary); box-shadow: none; animation: pulse 1.1s infinite; }
@@ -419,6 +468,11 @@
     <div class="menu" id="settingsMenu" hidden>
       <article class="card settings" id="settingsCard">
         <h2>Settings</h2>
+        <div class="advrow" style="border-top:0;padding-top:2px">
+          <span class="lbl"><b>ComfyUI Connection (Regular / Headless)</b>
+            <small id="settingsComfySummary">Point Studio to a local ComfyUI folder or a headless ComfyUI server URL.</small></span>
+          <button class="btn ghost" type="button" id="btnSettingsComfy" style="padding:5px 11px;font-size:12px">Configure…</button>
+        </div>
         <label class="toggle">
           <input type="checkbox" id="optCloseStops">
           <span><b>Closing this window also stops Studio</b>
@@ -438,6 +492,23 @@
 
 <main>
   <section class="col" aria-label="Launch">
+
+    <!-- Always-visible ComfyUI Connection & Folders bar so users never have to hunt for settings -->
+    <article class="card csrc-bar" id="comfyQuickBar">
+      <div class="csrc-bar-info">
+        <div class="csrc-bar-title">
+          <span>ComfyUI Engine</span>
+          <span class="csrc-badge" id="csrcBarBadge">Detecting…</span>
+          <span id="csrcBarTarget" style="font:12px var(--mono);color:var(--dim)">Scanning system…</span>
+        </div>
+        <div class="csrc-bar-sub" id="csrcBarSub">Configure a local ComfyUI folder, scan drives for models, or connect to a networked ComfyUI server.</div>
+      </div>
+      <div class="csrc-bar-actions">
+        <button type="button" class="btn ghost" id="btnQuickRegular" title="Configure or use a local ComfyUI install">Regular (Local)</button>
+        <button type="button" class="btn ghost" id="btnQuickHeadless" title="Connect to or scan for a networked ComfyUI server">Headless (Network)</button>
+        <button type="button" class="btn" id="btnQuickConfigure">Scan &amp; Configure…</button>
+      </div>
+    </article>
 
     <!-- Shown when this machine has no ComfyUI. One question, then Studio
          installs its own ComfyUI with the right PyTorch (scripts/install-engine.mjs).
@@ -460,7 +531,7 @@
       </div>
       <pre class="ierr" id="setupErr" hidden></pre>
       <p class="iok" id="setupOk" hidden>Installed. Launch Full Studio below.</p>
-      <p class="sub" id="setupHave">Already have ComfyUI? Use <b>Change…</b> beside “ComfyUI install” instead.</p>
+      <p class="sub" id="setupHave">Already have ComfyUI? Use <button type="button" class="btn ghost" id="btnSetupComfy" style="padding:3px 10px;font-size:12px">Point to Regular or Headless ComfyUI…</button> or <b>Change…</b> beside “ComfyUI install”.</p>
     </article>
 
     <!-- A weak or missing graphics card: a friend's card FIRST (Collab, in Full
@@ -636,6 +707,116 @@
     <div class="actions">
       <button class="btn ghost" type="button" id="askNo">Cancel</button>
       <button class="btn" type="button" id="askYes">OK</button>
+    </div>
+  </article>
+</div>
+
+<!-- ComfyUI Install modal: Regular (local folder) or Headless (HTTP/WS URL). -->
+<div class="modal" id="comfyModal" hidden role="dialog" aria-modal="true" aria-labelledby="comfyModalTitle">
+  <article class="card comfy-card">
+    <div>
+      <h3 id="comfyModalTitle">ComfyUI Setup &amp; Scanner (Local or Networked)</h3>
+      <p>Select a detected ComfyUI install or model folder on this machine, scan any drive or mount for files, or type/scan for a networked ComfyUI server on another system.</p>
+    </div>
+    <div class="csrc-tabs" role="tablist">
+      <button type="button" class="csrc-tab active" id="csrcTabRegular" data-csrc-mode="regular">
+        <b>Regular ComfyUI Install</b>
+        <small>Local folder (main.py + Python venv)</small>
+      </button>
+      <button type="button" class="csrc-tab" id="csrcTabHeadless" data-csrc-mode="headless">
+        <b>Networked / Headless ComfyUI</b>
+        <small>Remote or local HTTP / WebSocket server</small>
+      </button>
+    </div>
+
+    <div id="csrcPaneRegular" style="display:grid;gap:12px">
+      <div class="csrc-field">
+        <label for="csrcScanPathInput">Scan a folder, drive, or mount for ComfyUI &amp; model files</label>
+        <div class="csrc-row" style="grid-template-columns:1fr auto auto">
+          <input type="text" id="csrcScanPathInput" placeholder="Enter folder or mount path to scan (e.g. /mnt, /media, ~/AI, D:\)">
+          <button type="button" class="btn ghost" id="csrcBrowseScanBtn">Browse…</button>
+          <button type="button" class="btn ghost" id="csrcScanFolderBtn">Scan for Files</button>
+        </div>
+        <small>Scans subdirectories for ComfyUI installs (<code>main.py</code>), Python virtual environments, and model folders.</small>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcRigSelect">Select detected ComfyUI install</label>
+        <select id="csrcRigSelect" style="width:100%;padding:8px 10px;background:var(--raise);border:1px solid var(--line);border-radius:8px;color:var(--ink);font:12px var(--mono)">
+          <option value="">— Select a detected ComfyUI install or enter a path below —</option>
+        </select>
+        <div class="csrc-chips" id="csrcRigChips"></div>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcRigInput">Local ComfyUI folder path</label>
+        <div class="csrc-row">
+          <input type="text" id="csrcRigInput" placeholder="Path to ComfyUI folder (containing main.py)">
+          <button type="button" class="btn ghost" id="csrcBrowseBtn">Browse…</button>
+        </div>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcPyInput">Python executable (venv)</label>
+        <div class="csrc-row">
+          <input type="text" id="csrcPyInput" placeholder="Auto-detected from .venv / venv when left blank">
+          <select id="csrcPySelect" style="max-width:220px;padding:8px 10px;background:var(--raise);border:1px solid var(--line);border-radius:8px;color:var(--ink);font:12px var(--mono)">
+            <option value="">Detected Python…</option>
+          </select>
+        </div>
+        <div class="csrc-chips" id="csrcPyChips"></div>
+      </div>
+    </div>
+
+    <div id="csrcPaneHeadless" hidden style="display:grid;gap:12px">
+      <div class="csrc-field">
+        <label for="csrcUrlInput">Networked or Local Headless ComfyUI Server (URL or IP:Port)</label>
+        <div class="csrc-row" style="grid-template-columns:1fr auto auto">
+          <input type="text" id="csrcUrlInput" placeholder="e.g. http://192.168.1.50:8188, gpu-box.local:8188, or http://127.0.0.1:8188">
+          <button type="button" class="btn ghost" id="csrcScanNetBtn" title="Scan your local network (LAN) for running ComfyUI servers">Scan Network (LAN)</button>
+          <button type="button" class="btn ghost" id="csrcScanRemoteModelsBtn" title="Query the networked ComfyUI server for its available models">Scan Server Models</button>
+        </div>
+        <small>Type any IP/hostname:port on your network or click <b>Scan Network (LAN)</b> to find running ComfyUI servers automatically.</small>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcUrlSelect">Select discovered or saved ComfyUI server</label>
+        <select id="csrcUrlSelect" style="width:100%;padding:8px 10px;background:var(--raise);border:1px solid var(--line);border-radius:8px;color:var(--ink);font:12px var(--mono)">
+          <option value="">— Select a discovered or saved server —</option>
+        </select>
+        <div class="csrc-chips" id="csrcUrlChips"></div>
+      </div>
+      <div class="csrc-status" id="csrcRemoteModelsBox" hidden style="max-height:140px;overflow:auto;font:11px/1.45 var(--mono)"></div>
+    </div>
+
+    <div style="display:grid;gap:10px;border-top:1px solid var(--hair);padding-top:10px">
+      <div class="csrc-field">
+        <label for="csrcModelsSelect">Select discovered models folder</label>
+        <select id="csrcModelsSelect" style="width:100%;padding:8px 10px;background:var(--raise);border:1px solid var(--line);border-radius:8px;color:var(--ink);font:12px var(--mono)">
+          <option value="">— Select a discovered models folder —</option>
+        </select>
+        <div class="csrc-chips" id="csrcModelsChips"></div>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcModelsInput">Primary Models folder</label>
+        <div class="csrc-row" style="grid-template-columns:1fr auto auto">
+          <input type="text" id="csrcModelsInput" placeholder="Path to models folder (checkpoints, diffusion_models, vae…)">
+          <button type="button" class="btn ghost" id="csrcBrowseModelsBtn">Browse…</button>
+          <button type="button" class="btn ghost" id="csrcAddExtraModelsBtn" title="Keep your primary models folder and add this path as an additional models folder">+ Add as Extra</button>
+        </div>
+        <small id="csrcExtraModelsNote"></small>
+      </div>
+      <div class="csrc-field">
+        <label for="csrcOutInput">Output folder (songs, clips &amp; renders)</label>
+        <div class="csrc-row">
+          <input type="text" id="csrcOutInput" placeholder="Path to output folder">
+          <button type="button" class="btn ghost" id="csrcBrowseOutBtn">Browse…</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="csrc-status" id="csrcStatus" hidden></div>
+
+    <div class="actions">
+      <button type="button" class="btn ghost" id="csrcCancelBtn">Cancel</button>
+      <button type="button" class="btn ghost" id="csrcTestBtn">Test</button>
+      <button type="button" class="btn" id="csrcSaveBtn">Save</button>
     </div>
   </article>
 </div>
@@ -1016,6 +1197,10 @@ document.addEventListener("click", async (e) => {
   /* The native folder dialog opens on the desktop, in front of this window. */
   const p = e.target.closest("[data-pick]");
   if (p) {
+    if (p.dataset.pick === "comfy") {
+      await openComfyModal();
+      return;
+    }
     p.disabled = true;
     p.textContent = "Choosing…";
     try {
@@ -1024,6 +1209,431 @@ document.addEventListener("click", async (e) => {
       else if (!r.cancelled) { await loadCheck(true); return; }
     } finally { p.disabled = false; p.textContent = "Change…"; }
   }
+});
+
+/* ── ComfyUI source modal (Regular local folder / Headless HTTP URL) ─── */
+let csrcMode = "regular";
+let csrcStateCache = null;
+function setCsrcMode(m) {
+  csrcMode = m === "headless" ? "headless" : "regular";
+  $("csrcTabRegular").classList.toggle("active", csrcMode === "regular");
+  $("csrcTabHeadless").classList.toggle("active", csrcMode === "headless");
+  $("csrcPaneRegular").hidden = csrcMode !== "regular";
+  $("csrcPaneHeadless").hidden = csrcMode !== "headless";
+  $("csrcPaneRegular").style.display = csrcMode === "regular" ? "grid" : "none";
+  $("csrcPaneHeadless").style.display = csrcMode === "headless" ? "grid" : "none";
+  $("csrcTestBtn").textContent = csrcMode === "headless" ? "Test Connection" : "Test Folder";
+}
+function showCsrcStatus(text, kind = "") {
+  const el = $("csrcStatus");
+  el.hidden = !text;
+  el.className = `csrc-status${kind ? ` ${kind}` : ""}`;
+  el.textContent = text || "";
+}
+function paintComfyQuickBar(s) {
+  if (!s) return;
+  const isHeadless = s.comfyMode === "headless";
+  $("csrcBarBadge").textContent = isHeadless ? "Headless Server" : "Regular Install";
+  $("csrcBarTarget").textContent = isHeadless
+    ? (s.comfyUrl || "http://127.0.0.1:8188")
+    : (s.comfyDir || s.rig || "No local ComfyUI selected");
+  const onlineSrv = (s.presets?.headlessServers || []).find((x) => x.url === s.comfyUrl && x.online);
+  const extraCount = Array.isArray(s.modelsAlso) ? s.modelsAlso.length : 0;
+  const modelsText = s.modelsDir
+    ? `${s.modelsDir}${extraCount ? ` (+${extraCount} extra)` : ""}`
+    : "default";
+  $("csrcBarSub").textContent = isHeadless
+    ? `Server: ${s.comfyUrl || "http://127.0.0.1:8188"}${onlineSrv?.device ? ` (${onlineSrv.device}${onlineSrv.vramMb ? ` · ${(onlineSrv.vramMb / 1024).toFixed(1)} GB` : ""})` : ""} · Models: ${modelsText}`
+    : `Models: ${modelsText} · Python: ${s.python || s.detectedPython || "auto"}`;
+  $("btnQuickRegular")?.classList.toggle("active", !isHeadless);
+  $("btnQuickHeadless")?.classList.toggle("active", isHeadless);
+  const sum = $("settingsComfySummary");
+  if (sum) {
+    sum.textContent = isHeadless
+      ? `Active: Headless (${s.comfyUrl || "http://127.0.0.1:8188"})`
+      : `Active: Regular (${s.comfyDir || s.rig || "not set"})`;
+  }
+  if ($("csrcExtraModelsNote")) {
+    $("csrcExtraModelsNote").textContent = extraCount
+      ? `Extra model folders also loaded: ${s.modelsAlso.join(", ")}`
+      : "Tip: Use '+ Add as Extra' to attach additional model folders or network shares.";
+  }
+}
+function mergeDiscoveredIntoState(scanRes) {
+  if (!csrcStateCache) csrcStateCache = { presets: { regularInstalls: [], headlessServers: [], modelFolders: [], pythonEnvs: [] } };
+  const p = (csrcStateCache.presets ||= { regularInstalls: [], headlessServers: [], modelFolders: [], pythonEnvs: [] });
+  if (Array.isArray(scanRes.regularInstalls)) {
+    for (const inst of scanRes.regularInstalls) {
+      if (!p.regularInstalls.some((x) => x.comfyDir === inst.comfyDir)) p.regularInstalls.push(inst);
+    }
+  }
+  if (Array.isArray(scanRes.modelFolders)) {
+    for (const mf of scanRes.modelFolders) {
+      if (!p.modelFolders.some((x) => x.path === mf.path)) p.modelFolders.push(mf);
+    }
+  }
+  if (Array.isArray(scanRes.pythonEnvs)) {
+    for (const py of scanRes.pythonEnvs) {
+      if (!p.pythonEnvs.some((x) => x.path === py.path)) p.pythonEnvs.push(py);
+    }
+  }
+  if (Array.isArray(scanRes.servers)) {
+    for (const srv of scanRes.servers) {
+      const idx = p.headlessServers.findIndex((x) => x.url === srv.url);
+      if (idx >= 0) p.headlessServers[idx] = srv;
+      else p.headlessServers.unshift(srv);
+    }
+  }
+  populateComfyChips(csrcStateCache);
+}
+function populateComfyChips(s) {
+  if (!s?.presets) return;
+  const installs = s.presets.regularInstalls || [];
+  if ($("csrcRigSelect")) {
+    $("csrcRigSelect").innerHTML = `<option value="">— Select a detected ComfyUI install (${installs.length} found) —</option>`
+      + installs.map((inst, i) => `<option value="${i}">${esc(inst.label)}${inst.python ? ` · Python ready` : ""}</option>`).join("");
+  }
+  if ($("csrcRigChips")) {
+    $("csrcRigChips").innerHTML = installs.length
+      ? `<span>Detected installs:</span>` + installs.map((inst) =>
+        `<button type="button" class="csrc-chip" data-csrc-rig="${esc(inst.rig)}" data-csrc-py="${esc(inst.python || "")}" data-csrc-models="${esc(inst.modelsDir || "")}" data-csrc-out="${esc(inst.outputDir || "")}">${esc(inst.label)}</button>`
+      ).join("")
+      : `<span>No local ComfyUI found in default paths — use Scan for Files above or Browse.</span>`;
+  }
+  const pyEnvs = s.presets.pythonEnvs || [];
+  if ($("csrcPySelect")) {
+    $("csrcPySelect").innerHTML = `<option value="">Detected Python (${pyEnvs.length})…</option>`
+      + pyEnvs.map((py) => `<option value="${esc(py.path)}">${esc(py.label)}</option>`).join("");
+  }
+  if ($("csrcPyChips")) {
+    $("csrcPyChips").innerHTML = pyEnvs.length
+      ? `<span>Detected Python:</span>` + pyEnvs.map((py) =>
+        `<button type="button" class="csrc-chip" data-csrc-set="csrcPyInput" data-val="${esc(py.path)}">${esc(py.label)}</button>`
+      ).join("")
+      : "";
+  }
+  const servers = s.presets.headlessServers || [];
+  if ($("csrcUrlSelect")) {
+    $("csrcUrlSelect").innerHTML = `<option value="">— Select a discovered or saved server (${servers.length}) —</option>`
+      + servers.map((srv) => {
+        const hw = srv.online ? ` [Online${srv.device ? ` · ${srv.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim()}` : ""}]` : "";
+        return `<option value="${esc(srv.url)}">${esc(srv.label)}${esc(hw)}</option>`;
+      }).join("");
+  }
+  if ($("csrcUrlChips")) {
+    $("csrcUrlChips").innerHTML = servers.length
+      ? `<span>Servers:</span>` + servers.map((srv) => {
+        const hw = srv.online ? ` · Online${srv.device ? ` (${srv.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim()})` : ""}` : "";
+        return `<button type="button" class="csrc-chip" data-csrc-url="${esc(srv.url)}"><span class="csrc-dot${srv.online ? " on" : ""}"></span>${esc(srv.label)}${esc(hw)}</button>`;
+      }).join("")
+      : "";
+  }
+  const mFolders = s.presets.modelFolders || [];
+  if ($("csrcModelsSelect")) {
+    $("csrcModelsSelect").innerHTML = `<option value="">— Select a discovered models folder (${mFolders.length} found) —</option>`
+      + mFolders.map((mf) => `<option value="${esc(mf.path)}">${esc(mf.label)}</option>`).join("");
+  }
+  if ($("csrcModelsChips")) {
+    $("csrcModelsChips").innerHTML = mFolders.length
+      ? `<span>Detected model folders:</span>` + mFolders.map((mf) =>
+        `<button type="button" class="csrc-chip" data-csrc-set="csrcModelsInput" data-val="${esc(mf.path)}">${esc(mf.label)}</button>`
+      ).join("")
+      : "";
+  }
+}
+async function refreshComfySourceBar() {
+  try {
+    const s = await api("/api/comfy-source");
+    csrcStateCache = s;
+    paintComfyQuickBar(s);
+    populateComfyChips(s);
+    return s;
+  } catch { return null; }
+}
+async function openComfyModal(preferMode) {
+  showCsrcStatus("");
+  if ($("csrcRemoteModelsBox")) $("csrcRemoteModelsBox").hidden = true;
+  const s = (await refreshComfySourceBar()) || csrcStateCache;
+  if (s) {
+    $("csrcRigInput").value = s.comfyDir || s.rig || "";
+    $("csrcPyInput").value = s.python || s.detectedPython || "";
+    $("csrcUrlInput").value = s.comfyUrl || "http://127.0.0.1:8188";
+    $("csrcModelsInput").value = s.modelsDir || "";
+    $("csrcOutInput").value = s.outputDir || "";
+    setCsrcMode(preferMode || s.comfyMode || "regular");
+  } else {
+    setCsrcMode(preferMode || "regular");
+  }
+  $("comfyModal").hidden = false;
+}
+function closeComfyModal() { $("comfyModal").hidden = true; }
+$("btnSetupComfy")?.addEventListener("click", () => openComfyModal());
+$("btnSettingsComfy")?.addEventListener("click", () => { closeMenus(); openComfyModal(); });
+$("btnQuickConfigure")?.addEventListener("click", () => openComfyModal());
+$("btnQuickRegular")?.addEventListener("click", async () => {
+  const s = csrcStateCache || (await refreshComfySourceBar()) || {};
+  const rig = s.comfyDir || s.rig || "";
+  if (!rig) { openComfyModal("regular"); return; }
+  const r = await api("/api/comfy-source", {
+    action: "save",
+    comfyMode: "regular",
+    rig,
+    python: s.python || s.detectedPython || "",
+    modelsDir: s.modelsDir || "",
+    outputDir: s.outputDir || "",
+  });
+  if (r.error) { openComfyModal("regular"); showCsrcStatus(r.error, "err"); return; }
+  await refreshComfySourceBar();
+  await loadCheck(true);
+});
+$("btnQuickHeadless")?.addEventListener("click", async () => {
+  const s = csrcStateCache || (await refreshComfySourceBar()) || {};
+  const url = s.comfyUrl || "";
+  if (!url) { openComfyModal("headless"); return; }
+  const r = await api("/api/comfy-source", {
+    action: "save",
+    comfyMode: "headless",
+    comfyUrl: url,
+    modelsDir: s.modelsDir || "",
+    outputDir: s.outputDir || "",
+  });
+  if (r.error) { openComfyModal("headless"); showCsrcStatus(r.error, "err"); return; }
+  await refreshComfySourceBar();
+  await loadCheck(true);
+});
+$("csrcRigSelect")?.addEventListener("change", () => {
+  const idx = Number($("csrcRigSelect").value);
+  const inst = csrcStateCache?.presets?.regularInstalls?.[idx];
+  if (!inst) return;
+  $("csrcRigInput").value = inst.rig || "";
+  if (inst.python) $("csrcPyInput").value = inst.python;
+  if (inst.modelsDir) $("csrcModelsInput").value = inst.modelsDir;
+  if (inst.outputDir) $("csrcOutInput").value = inst.outputDir;
+  showCsrcStatus(`Selected install: ${inst.rig}`, "ok");
+});
+$("csrcPySelect")?.addEventListener("change", () => {
+  if ($("csrcPySelect").value) {
+    $("csrcPyInput").value = $("csrcPySelect").value;
+    showCsrcStatus(`Selected Python: ${$("csrcPySelect").value}`, "ok");
+  }
+});
+$("csrcUrlSelect")?.addEventListener("change", () => {
+  if ($("csrcUrlSelect").value) {
+    $("csrcUrlInput").value = $("csrcUrlSelect").value;
+    showCsrcStatus(`Selected server: ${$("csrcUrlSelect").value} — click Test Connection, Scan Server Models, or Save.`, "ok");
+  }
+});
+$("csrcModelsSelect")?.addEventListener("change", () => {
+  if ($("csrcModelsSelect").value) {
+    $("csrcModelsInput").value = $("csrcModelsSelect").value;
+    showCsrcStatus(`Selected models folder: ${$("csrcModelsSelect").value}`, "ok");
+  }
+});
+$("csrcBrowseScanBtn")?.addEventListener("click", async () => {
+  $("csrcBrowseScanBtn").disabled = true;
+  try {
+    const r = await api("/api/comfy-source", { action: "browse", target: "scan" });
+    if (r.error) showCsrcStatus(r.error, "err");
+    else if (r.scanPath) {
+      $("csrcScanPathInput").value = r.scanPath;
+      $("csrcScanFolderBtn")?.click();
+    }
+  } finally { $("csrcBrowseScanBtn").disabled = false; }
+});
+$("csrcScanFolderBtn")?.addEventListener("click", async () => {
+  const scanPath = $("csrcScanPathInput").value.trim();
+  if (!scanPath) {
+    showCsrcStatus("Enter or browse to a folder/mount path to scan (e.g. /mnt, /media, ~/AI).", "err");
+    return;
+  }
+  $("csrcScanFolderBtn").disabled = true;
+  showCsrcStatus(`Scanning ${scanPath} for ComfyUI installs, Python venvs, and model folders…`);
+  try {
+    const r = await api("/api/comfy-source", { action: "scan-folder", scanPath });
+    if (r.error || !r.ok) {
+      showCsrcStatus(r.error || "Scan failed.", "err");
+      return;
+    }
+    mergeDiscoveredIntoState(r);
+    if (r.regularInstalls?.length && !$("csrcRigInput").value) {
+      const first = r.regularInstalls[0];
+      $("csrcRigInput").value = first.rig;
+      if (first.python && !$("csrcPyInput").value) $("csrcPyInput").value = first.python;
+    }
+    if (r.modelFolders?.length && !$("csrcModelsInput").value) {
+      $("csrcModelsInput").value = r.modelFolders[0].path;
+    }
+    showCsrcStatus(
+      `Scan complete in ${r.scannedPath}: found ${r.regularInstalls?.length || 0} ComfyUI install(s), `
+      + `${r.modelFolders?.length || 0} model folder(s), and ${r.pythonEnvs?.length || 0} Python env(s). Select them from the dropdowns or chips above.`,
+      "ok"
+    );
+  } finally { $("csrcScanFolderBtn").disabled = false; }
+});
+$("csrcScanNetBtn")?.addEventListener("click", async () => {
+  $("csrcScanNetBtn").disabled = true;
+  const rawHost = $("csrcUrlInput").value.trim();
+  const customHost = rawHost && rawHost !== "http://127.0.0.1:8188" ? rawHost : "";
+  showCsrcStatus("Scanning local network (LAN) on port 8188 for running ComfyUI servers…");
+  try {
+    const r = await api("/api/comfy-source", { action: "scan-network", customHost });
+    if (r.error || !r.ok) {
+      showCsrcStatus(r.error || "Network scan failed.", "err");
+      return;
+    }
+    mergeDiscoveredIntoState(r);
+    if (r.servers?.length) {
+      $("csrcUrlInput").value = r.servers[0].url;
+      showCsrcStatus(
+        `Found ${r.servers.length} running ComfyUI server(s) on your network: ${r.servers.map((s) => s.label).join(" | ")}.`,
+        "ok"
+      );
+    } else {
+      showCsrcStatus(
+        `No ComfyUI servers responded on port 8188${r.subnets?.length ? ` (scanned ${r.subnets.map((s) => `${s}.*`).join(", ")})` : ""}. Make sure remote ComfyUI is started with --listen 0.0.0.0, or enter its URL:port manually.`,
+        "err"
+      );
+    }
+  } finally { $("csrcScanNetBtn").disabled = false; }
+});
+$("csrcScanRemoteModelsBtn")?.addEventListener("click", async () => {
+  const url = $("csrcUrlInput").value.trim();
+  if (!url) {
+    showCsrcStatus("Enter or select a networked ComfyUI URL first.", "err");
+    return;
+  }
+  $("csrcScanRemoteModelsBtn").disabled = true;
+  showCsrcStatus(`Querying ${url}/models for remote model files…`);
+  try {
+    const r = await api("/api/comfy-source", { action: "scan-remote-models", comfyUrl: url });
+    if (r.error || !r.ok) {
+      showCsrcStatus(r.error || "Could not read remote models.", "err");
+      return;
+    }
+    const box = $("csrcRemoteModelsBox");
+    const shelves = Object.entries(r.folders || {});
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = `<b>Remote Server Models (${esc(r.url)} · ${r.totalFiles || 0} total files):</b><br>`
+        + (shelves.length
+          ? shelves.map(([k, list]) => `• <b>${esc(k)}</b> (${list.length}): ${esc(list.slice(0, 6).join(", "))}${list.length > 6 ? ` +${list.length - 6} more` : ""}`).join("<br>")
+          : "No models reported in standard shelves.");
+    }
+    showCsrcStatus(`Connected to ${r.url} (${r.version || "ComfyUI"}${r.device ? ` · ${r.device}` : ""}) — found ${r.totalFiles || 0} model files across ${shelves.length} shelves.`, "ok");
+  } finally { $("csrcScanRemoteModelsBtn").disabled = false; }
+});
+$("csrcAddExtraModelsBtn")?.addEventListener("click", async () => {
+  const dir = $("csrcModelsInput").value.trim();
+  if (!dir) {
+    showCsrcStatus("Select or enter a models folder first to add it as an extra folder.", "err");
+    return;
+  }
+  $("csrcAddExtraModelsBtn").disabled = true;
+  try {
+    const r = await api("/api/comfy-source", { action: "add-models-also", modelsDir: dir });
+    if (r.error) { showCsrcStatus(r.error, "err"); return; }
+    showCsrcStatus(r.note || `Added ${dir} to extra model folders.`, "ok");
+    await refreshComfySourceBar();
+  } finally { $("csrcAddExtraModelsBtn").disabled = false; }
+});
+$("csrcTabRegular").addEventListener("click", () => { showCsrcStatus(""); setCsrcMode("regular"); });
+$("csrcTabHeadless").addEventListener("click", () => { showCsrcStatus(""); setCsrcMode("headless"); });
+$("csrcCancelBtn").addEventListener("click", closeComfyModal);
+$("comfyModal").addEventListener("click", (e) => {
+  if (e.target === $("comfyModal")) { closeComfyModal(); return; }
+  const urlChip = e.target.closest("[data-csrc-url]");
+  if (urlChip) {
+    $("csrcUrlInput").value = urlChip.dataset.csrcUrl;
+    showCsrcStatus(`Selected ${urlChip.dataset.csrcUrl} — click Test Connection or Save.`, "ok");
+    return;
+  }
+  const rigChip = e.target.closest("[data-csrc-rig]");
+  if (rigChip) {
+    $("csrcRigInput").value = rigChip.dataset.csrcRig;
+    if (rigChip.dataset.csrcPy) $("csrcPyInput").value = rigChip.dataset.csrcPy;
+    if (rigChip.dataset.csrcModels) $("csrcModelsInput").value = rigChip.dataset.csrcModels;
+    if (rigChip.dataset.csrcOut) $("csrcOutInput").value = rigChip.dataset.csrcOut;
+    showCsrcStatus(`Populated Regular ComfyUI install: ${rigChip.dataset.csrcRig}`, "ok");
+    return;
+  }
+  const setChip = e.target.closest("[data-csrc-set]");
+  if (setChip) {
+    const target = $(setChip.dataset.csrcSet);
+    if (target) target.value = setChip.dataset.val;
+    showCsrcStatus(`Populated ${setChip.dataset.val}`, "ok");
+  }
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("comfyModal").hidden) closeComfyModal(); });
+$("csrcBrowseBtn").addEventListener("click", async () => {
+  $("csrcBrowseBtn").disabled = true;
+  try {
+    const r = await api("/api/comfy-source", { action: "browse", target: "rig", comfyMode: "regular" });
+    if (r.error) showCsrcStatus(r.error, "err");
+    else if (r.rig) {
+      $("csrcRigInput").value = r.rig;
+      if (r.detectedPython) $("csrcPyInput").value = r.detectedPython;
+      if (r.modelsDir) $("csrcModelsInput").value = r.modelsDir;
+      if (r.outputDir) $("csrcOutInput").value = r.outputDir;
+      showCsrcStatus(`Selected ${r.comfyDir || r.rig}${r.detectedPython ? ` · Python: ${r.detectedPython}` : ""}`, "ok");
+    }
+  } finally { $("csrcBrowseBtn").disabled = false; }
+});
+$("csrcBrowseModelsBtn")?.addEventListener("click", async () => {
+  $("csrcBrowseModelsBtn").disabled = true;
+  try {
+    const r = await api("/api/comfy-source", { action: "browse", target: "models" });
+    if (r.error) showCsrcStatus(r.error, "err");
+    else if (r.modelsDir) { $("csrcModelsInput").value = r.modelsDir; showCsrcStatus(`Models folder: ${r.modelsDir}`, "ok"); }
+  } finally { $("csrcBrowseModelsBtn").disabled = false; }
+});
+$("csrcBrowseOutBtn")?.addEventListener("click", async () => {
+  $("csrcBrowseOutBtn").disabled = true;
+  try {
+    const r = await api("/api/comfy-source", { action: "browse", target: "output" });
+    if (r.error) showCsrcStatus(r.error, "err");
+    else if (r.outputDir) { $("csrcOutInput").value = r.outputDir; showCsrcStatus(`Output folder: ${r.outputDir}`, "ok"); }
+  } finally { $("csrcBrowseOutBtn").disabled = false; }
+});
+$("csrcTestBtn").addEventListener("click", async () => {
+  $("csrcTestBtn").disabled = true;
+  showCsrcStatus(csrcMode === "headless" ? "Probing /system_stats…" : "Checking ComfyUI folder…");
+  try {
+    const r = await api("/api/comfy-source", {
+      action: "test",
+      comfyMode: csrcMode,
+      rig: $("csrcRigInput").value,
+      python: $("csrcPyInput").value,
+      comfyUrl: $("csrcUrlInput").value,
+      modelsDir: $("csrcModelsInput").value,
+      outputDir: $("csrcOutInput").value,
+    });
+    if (r.error || r.ok === false) showCsrcStatus(r.error || "Check failed.", "err");
+    else if (csrcMode === "headless") {
+      showCsrcStatus(`Connected to ${r.url} · ComfyUI ${r.version}${r.torch ? ` · PyTorch ${r.torch}` : ""}${r.device ? ` · ${r.device}${r.vramMb ? ` (${(r.vramMb / 1024).toFixed(1)} GB)` : ""}` : ""}`, "ok");
+    } else {
+      showCsrcStatus(r.note || `Found ComfyUI at ${r.comfyDir} · Python: ${r.python}`, "ok");
+    }
+  } finally { $("csrcTestBtn").disabled = false; }
+});
+$("csrcSaveBtn").addEventListener("click", async () => {
+  $("csrcSaveBtn").disabled = true;
+  showCsrcStatus("Saving…");
+  try {
+    const r = await api("/api/comfy-source", {
+      action: "save",
+      comfyMode: csrcMode,
+      rig: $("csrcRigInput").value,
+      python: $("csrcPyInput").value,
+      comfyUrl: $("csrcUrlInput").value,
+      modelsDir: $("csrcModelsInput").value,
+      outputDir: $("csrcOutInput").value,
+    });
+    if (r.error) { showCsrcStatus(r.error, "err"); return; }
+    showCsrcStatus(r.note || "Saved.", "ok");
+    closeComfyModal();
+    await refreshComfySourceBar();
+    await loadCheck(true);
+  } finally { $("csrcSaveBtn").disabled = false; }
 });
 /* Studio's own packages, into the engine Studio installed: the server's
  * install-engine.mjs --studio-packages. Deletes nothing; the engine keeps working either way. */
@@ -1205,6 +1815,7 @@ async function checkAlive() {
     if (install.state === "done" || install.state === "failed") loadCheck(true);
   });
   loadCheck(false);
+  refreshComfySourceBar();
   loadVersion();
 })();
 

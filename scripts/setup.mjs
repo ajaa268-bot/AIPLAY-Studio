@@ -59,16 +59,20 @@ if (JSON_OUT) console.log = (...a) => process.stderr.write(`${a.join(" ")}\n`);
 let report = { ok: false };
 
 const exists = async (p) => { try { await stat(p); return true; } catch { return false; } };
-const isEngine = async (rig) => exists(path.join(rig, "ComfyUI", "main.py"));
+const isEngine = async (rig) => (await exists(path.join(rig, "ComfyUI", "main.py"))) || (await exists(path.join(rig, "main.py")));
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 
 /** A ComfyUI needs a python that can actually run it. */
-async function pythonFor(rig) {
+async function pythonFor(rig, savedPy = null) {
+  if (savedPy && savedPy !== "headless" && await exists(savedPy)) return savedPy;
   for (const rel of [["venv", "Scripts", "python.exe"], ["venv", "bin", "python"],
                      ["python_embeded", "python.exe"], [".venv", "Scripts", "python.exe"],
+                     [".venv", "bin", "python"],
                      // ComfyUI Desktop: the venv sits INSIDE the ComfyUI folder.
                      ["ComfyUI", ".venv", "Scripts", "python.exe"],
-                     ["ComfyUI", ".venv", "bin", "python"]]) {
+                     ["ComfyUI", ".venv", "bin", "python"],
+                     ["ComfyUI", "venv", "Scripts", "python.exe"],
+                     ["ComfyUI", "venv", "bin", "python"]]) {
     const p = path.join(rig, ...rel);
     if (await exists(p)) return p;
   }
@@ -159,16 +163,81 @@ const vendorOf = (s) => /nvidia/i.test(s) ? "nvidia"
   : /\bamd\b|radeon|advanced micro/i.test(s) ? "amd"
   : /intel/i.test(s) ? "intel" : null;
 
-/** The discrete card: nvidia-smi if it answers, else Windows' display-adapter
- *  registry (Win32_VideoController.AdapterRAM is a 32-bit field capped at 4 GB,
- *  so it cannot be used for a 16 GB card). */
+/** Linux DRM sysfs + lspci / vulkaninfo detection for AMD, Intel Arc/iGPU and NVIDIA. */
+export async function detectLinuxGpu(drmRoot = "/sys/class/drm") {
+  let pciNames = new Map();
+  try {
+    const { stdout: lspciOut } = await run("lspci", ["-D"], { timeout: 5000 });
+    for (const line of lspciOut.split(/\r?\n/)) {
+      const m = line.match(/^([0-9a-f:.]+)\s+(?:VGA compatible controller|3D controller|Display controller):\s+(.+)$/i);
+      if (m) pciNames.set(m[1].toLowerCase(), m[2].replace(/\s*\(rev [0-9a-f]+\)\s*$/i, "").trim());
+    }
+  } catch { /* lspci optional */ }
+
+  let cards = [];
+  try { cards = (await readdir(drmRoot)).filter((c) => /^card\d+$/.test(c)); } catch { cards = []; }
+  const found = [];
+  for (const c of cards) {
+    const dev = path.join(drmRoot, c, "device");
+    const readTxt = async (f) => { try { return (await readFile(path.join(dev, f), "utf8")).trim(); } catch { return ""; } };
+    const readNum = async (f) => { const t = await readTxt(f); return t ? Number(t) : NaN; };
+    const vendorHex = (await readTxt("vendor")).toLowerCase();
+    const uevent = await readTxt("uevent");
+    const slot = uevent.match(/^PCI_SLOT_NAME=(.+)$/m)?.[1]?.trim()?.toLowerCase() || "";
+    const pciDesc = (slot && pciNames.get(slot)) || "";
+    const prodName = await readTxt("product_name");
+    const vendor = vendorHex === "0x1002" ? "amd"
+      : vendorHex === "0x8086" ? "intel"
+      : vendorHex === "0x10de" ? "nvidia"
+      : vendorOf(`${prodName} ${pciDesc}`);
+    if (!vendor) continue;
+    const vramBytes = [
+      await readNum("mem_info_vram_total"),
+      await readNum("lmem_total_bytes"),
+      await readNum(path.join("tile0", "lmem_total_bytes")),
+    ].find((v) => Number.isFinite(v) && v > 0) || 0;
+    const totalMb = vramBytes > 0 ? Math.round(vramBytes / 1048576) : 0;
+    const name = prodName || pciDesc || (vendor === "amd" ? "AMD GPU" : vendor === "intel" ? "Intel GPU" : "NVIDIA GPU");
+    found.push({ vendor, name, totalMb, source: "Linux DRM (sysfs)" });
+  }
+  const withVram = found.filter((g) => g.totalMb > 0).sort((a, b) => b.totalMb - a.totalMb);
+  if (withVram.length) return withVram[0];
+
+  /* Fallback to vulkaninfo --summary for Linux Intel Arc / iGPU or AMD APUs when sysfs VRAM is absent. */
+  try {
+    const { stdout: vkOut } = await run("vulkaninfo", ["--summary"], { timeout: 6000 });
+    const blocks = vkOut.split(/GPU\d+:\s*\r?\n/).slice(1);
+    for (const b of blocks) {
+      if (/PHYSICAL_DEVICE_TYPE_CPU|llvmpipe|lavapipe/i.test(b)) continue;
+      const devName = b.match(/deviceName\s*=\s*(.+)/)?.[1]?.trim() || "";
+      const vendId = b.match(/vendorID\s*=\s*(0x[0-9a-f]+)/i)?.[1]?.toLowerCase() || "";
+      const vendor = vendId === "0x1002" ? "amd" : vendId === "0x8086" ? "intel" : vendId === "0x10de" ? "nvidia" : vendorOf(devName);
+      if (vendor && devName) {
+        const matchSysfs = found.find((g) => g.vendor === vendor);
+        return { vendor, name: devName, totalMb: matchSysfs?.totalMb || 0, source: "vulkaninfo" };
+      }
+    }
+  } catch { /* vulkaninfo optional */ }
+  return found[0] || null;
+}
+
+/** The discrete card: nvidia-smi if it answers, Linux DRM sysfs / vulkaninfo on
+ *  Linux, else Windows' display-adapter registry (Win32_VideoController.AdapterRAM
+ *  is a 32-bit field capped at 4 GB, so it cannot be used for a 16 GB card). */
 async function detectGpu() {
   try {
     const { stdout: o } = await run("nvidia-smi",
       ["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"], { timeout: 8000, windowsHide: true });
-    const [name, total] = o.split(/\r?\n/)[0].split(",").map((x) => x.trim());
-    if (Number(total) > 0) return { vendor: "nvidia", name, totalMb: Number(total), source: "nvidia-smi" };
+    const best = o.split(/\r?\n/).filter(Boolean).map((line) => {
+      const [name = "", total = "0"] = line.split(",").map((x) => x.trim());
+      return { vendor: "nvidia", name, totalMb: Number(total), source: "nvidia-smi" };
+    }).filter((c) => c.name && c.totalMb > 0).sort((a, b) => b.totalMb - a.totalMb)[0];
+    if (best) return best;
   } catch { /* not NVIDIA, or no driver */ }
+  if (process.platform === "linux") {
+    const linuxCard = await detectLinuxGpu();
+    if (linuxCard) return linuxCard;
+  }
   if (process.platform !== "win32") return null;
   const ps = "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' "
     + "-ErrorAction SilentlyContinue | ForEach-Object { $v = $_.'HardwareInformation.qwMemorySize'; "
@@ -220,6 +289,10 @@ function mismatch(gpu, tb, chosen = null) {
     return `This is an NVIDIA card (${gpu.name}) but the engine's torch (${tb.version}) is a ROCm build. `
       + "Use the NVIDIA build of ComfyUI (the plain _nvidia portable build).";
   }
+  if (gpu?.vendor === "intel" && (tb.backend === "cuda" || tb.backend === "rocm")) {
+    return `This is an Intel card (${gpu.name}) but the engine's torch (${tb.version}) is a ${tb.backend.toUpperCase()} build. `
+      + "Use an Intel XPU build of PyTorch for ComfyUI.";
+  }
   return null;
 }
 
@@ -237,6 +310,8 @@ async function guess() {
   const roots = [
     path.join(home, "ComfyUI"), path.join(home, "Documents", "ComfyUI"),
     path.join(home, "Desktop", "ComfyUI"),
+    path.join(home, ".local", "share", "ComfyUI"),
+    path.join(home, "AI", "ComfyUI"),
     /* AppData, because the ComfyUI Desktop installer does not put itself on a
      * drive root or in Documents the way the portable build does. These are the
      * parent folders; the one-level-down scan below finds whatever it named the
@@ -255,6 +330,7 @@ async function guess() {
   for (const r of roots) {
     if (!(await exists(r))) continue;
     if (await isEngine(r)) { found.push(r); continue; }
+    if (path.basename(r) === "ComfyUI" && await isEngine(path.dirname(r))) { found.push(path.dirname(r)); continue; }
     // One level down, so `D:\AI\<anything>\ComfyUI\main.py` is caught too.
     try {
       for (const e of await readdir(r, { withFileTypes: true })) {
@@ -278,7 +354,7 @@ async function saved() {
  * --redetect — the card and the torch build. Writes only when something changed.
  */
 async function finalize(rig, cur, { announce }) {
-  const py = await pythonFor(rig);
+  const py = await pythonFor(rig, cur.rig && samePath(cur.rig, rig) ? cur.python : null);
   if (!py) {
     console.log(`\n  Found ComfyUI at ${rig}, but no python environment inside it.`);
     console.log(`  Looked for venv\\Scripts\\python.exe, python_embeded\\python.exe and ComfyUI\\.venv.`);
@@ -370,11 +446,40 @@ async function finalize(rig, cur, { announce }) {
 
 async function main() {
   let cur = await saved();
+  const headlessRaw = process.env.AIPLAY_COMFY_URL || (cur.comfyMode === "headless" ? cur.comfyUrl : "");
+  if (headlessRaw) {
+    try {
+      const u = new URL(String(headlessRaw).trim());
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        const comfyUrl = u.origin + (u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "");
+        if (!cur.gpu) {
+          const gpu = await detectGpu();
+          if (gpu) {
+            cur = { ...cur, gpu };
+            await mkdir(path.dirname(SETTINGS), { recursive: true });
+            await writeFile(SETTINGS, JSON.stringify(cur, null, 2));
+          }
+        }
+        report = {
+          ok: true, comfyMode: "headless", comfyUrl,
+          rig: cur.rig || comfyUrl, python: cur.python || "headless",
+          gpu: cur.gpu || null,
+          torchBackend: cur.torchBackend || "cuda",
+          torchVersion: cur.torchVersion || "headless",
+          launchFrom: `Headless ComfyUI (${comfyUrl})`,
+          comfyExtraArgs: [], modelsDir: cur.modelsDir || null, notes: [],
+          mismatch: null, engineInstall: cur.engineInstall || null, comfyPin: null,
+        };
+        if (!QUIET) console.log(`  headless engine: ${comfyUrl}`);
+        return 0;
+      }
+    } catch { /* fall through if invalid URL */ }
+  }
   /* THE CARD FIRST, whatever else is missing. This used to be read only once a
    * ComfyUI was found, so a machine with no ComfyUI yet reported "No NVIDIA or
    * AMD card could be read" while the card sat right there — and the launcher's
    * "What should Studio run on?" choice had nothing to preselect. */
-  if (!cur.gpu || REDETECT) {
+  if (!cur.gpu || REDETECT || cur.gpu?.source?.startsWith?.("headless")) {
     const gpu = await detectGpu();
     if (gpu && JSON.stringify(gpu) !== JSON.stringify(cur.gpu)) {
       cur = { ...cur, gpu };

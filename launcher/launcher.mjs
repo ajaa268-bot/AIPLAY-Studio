@@ -22,10 +22,10 @@ import http from "node:http";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { homedir, totalmem } from "node:os";
+import { homedir, totalmem, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanBases, extraBases, uniqueDirs, countByFolder, pickFolderDialog, MODELS_PROMPT } from "../server/localmodels.js";
+import { scanBases, extraBases, uniqueDirs, countByFolder, pickFolderDialog, MODELS_PROMPT, discoverComfyPresets, scanPathForComfyAssets } from "../server/localmodels.js";
 import { appVersion, versionLine } from "../server/version.js";
 import { checkUpdates, lastCheck, updateSentence } from "../server/updates.js";
 import { selfUpdate, updateSource } from "../server/selfupdate.js";
@@ -238,9 +238,9 @@ function which(cmd) {
   });
 }
 
-async function probeStudio() {
+async function probeStudio(timeoutMs = 6000) {
   try {
-    const r = await fetch(`${STUDIO_URL}/api/status`, { signal: AbortSignal.timeout(1500) });
+    const r = await fetch(`${STUDIO_URL}/api/status`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return null;
     const s = await r.json();
     return {
@@ -271,6 +271,151 @@ function openInBrowser(url) {
 let checkCache = null;
 let checkInFlight = null;
 
+function resolveComfyDir(rig) {
+  if (!rig) return "";
+  try {
+    if (existsSync(path.join(rig, "ComfyUI", "main.py"))) return path.join(rig, "ComfyUI");
+    if (existsSync(path.join(rig, "main.py"))) return rig;
+  } catch { /* fall back */ }
+  return path.join(rig, "ComfyUI");
+}
+
+function normalizeHeadlessUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const withScheme = /^https?:\/\//i.test(s) ? s : `http://${s}`;
+  try {
+    const u = new URL(withScheme);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.origin + (u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "");
+  } catch { return null; }
+}
+
+async function probeHeadlessComfy(rawUrl, timeoutMs = 3500) {
+  const url = normalizeHeadlessUrl(rawUrl);
+  if (!url) return { ok: false, error: "Enter a valid HTTP(S) URL (e.g. http://127.0.0.1:8188 or http://<server-ip>:8188)." };
+  try {
+    const r = await fetch(`${url}/system_stats`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!r.ok) return { ok: false, url, error: `Server responded with HTTP ${r.status} on /system_stats.` };
+    const s = await r.json();
+    const dev0 = Array.isArray(s?.devices) ? s.devices[0] : null;
+    return {
+      ok: true,
+      url,
+      version: s?.system?.comfyui_version || "ComfyUI",
+      torch: s?.system?.pytorch_version || null,
+      device: dev0?.name || null,
+      vramMb: Number.isFinite(dev0?.vram_total) ? Math.round(dev0.vram_total / 1048576) : null,
+    };
+  } catch (e) {
+    return { ok: false, url, error: `Could not reach ${url}/system_stats (${e.message || e}).` };
+  }
+}
+
+async function scanNetworkComfy({ customHost = "", ports = [8188], timeoutMs = 450 } = {}) {
+  const portList = Array.isArray(ports) && ports.length
+    ? ports.map((p) => Number(p)).filter((p) => Number.isInteger(p) && p > 0 && p < 65536)
+    : [8188];
+  const candidates = new Set();
+  for (const p of portList) candidates.add(`http://127.0.0.1:${p}`);
+  const raw = String(customHost || "").trim();
+  const subnets = [];
+  if (raw) {
+    const subMatch = raw.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})(?:\.\*|\.0\/24)?$/);
+    if (subMatch) {
+      subnets.push(subMatch[1]);
+    } else {
+      const hasPort = /:\d+(\/|$)/.test(raw);
+      if (hasPort || /^https?:\/\//i.test(raw)) {
+        candidates.add(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
+      } else {
+        for (const p of portList) candidates.add(`http://${raw}:${p}`);
+      }
+    }
+  }
+  if (!subnets.length) {
+    const nets = networkInterfaces();
+    for (const list of Object.values(nets)) {
+      for (const iface of list || []) {
+        if (!iface || iface.internal || iface.family !== "IPv4") continue;
+        const parts = String(iface.address || "").split(".");
+        if (parts.length === 4 && (parts[0] === "192" || parts[0] === "10" || parts[0] === "172")) {
+          const prefix = `${parts[0]}.${parts[1]}.${parts[2]}`;
+          if (!subnets.includes(prefix) && subnets.length < 2) subnets.push(prefix);
+        }
+      }
+    }
+  }
+  for (const prefix of subnets) {
+    for (let host = 1; host <= 254; host++) {
+      for (const p of portList) candidates.add(`http://${prefix}.${host}:${p}`);
+    }
+  }
+  const urls = [...candidates];
+  const servers = [];
+  const batchSize = 48;
+  for (let i = 0; i < urls.length; i += batchSize) {
+    const slice = urls.slice(i, i + batchSize);
+    const res = await Promise.all(slice.map((u) => probeHeadlessComfy(u, timeoutMs)));
+    for (const r of res) {
+      if (r?.ok && r.url) {
+        const cleanGpu = r.device ? r.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim() : null;
+        servers.push({
+          url: r.url,
+          label: `${r.url.replace(/^https?:\/\//, "")}${cleanGpu ? ` · ${cleanGpu}` : ""}${r.vramMb ? ` (${(r.vramMb / 1024).toFixed(1)} GB)` : ""}`,
+          online: true,
+          version: r.version || null,
+          torch: r.torch || null,
+          device: r.device || null,
+          vramMb: r.vramMb || null,
+        });
+      }
+    }
+  }
+  return { ok: true, subnets, servers };
+}
+
+async function scanRemoteModels(rawUrl, timeoutMs = 4000) {
+  const probe = await probeHeadlessComfy(rawUrl, timeoutMs);
+  if (!probe.ok) return probe;
+  const url = probe.url;
+  const wantedShelves = [
+    "checkpoints", "diffusion_models", "unet", "vae", "loras",
+    "text_encoders", "clip", "audio_encoders", "controlnet", "upscale_models",
+  ];
+  let availableShelves = wantedShelves;
+  try {
+    const r = await fetch(`${url}/models`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (r.ok) {
+      const list = await r.json();
+      if (Array.isArray(list)) availableShelves = wantedShelves.filter((s) => list.includes(s));
+    }
+  } catch { /* fallback */ }
+  const folders = {};
+  let totalFiles = 0;
+  await Promise.all(availableShelves.map(async (shelf) => {
+    try {
+      const r = await fetch(`${url}/models/${encodeURIComponent(shelf)}`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!r.ok) return;
+      const files = await r.json();
+      if (Array.isArray(files) && files.length) {
+        folders[shelf] = files.map(String);
+        totalFiles += files.length;
+      }
+    } catch { /* ignore */ }
+  }));
+  return {
+    ok: true,
+    url,
+    version: probe.version,
+    torch: probe.torch,
+    device: probe.device,
+    vramMb: probe.vramMb,
+    totalFiles,
+    folders,
+  };
+}
+
 async function systemCheck({ redetect = false } = {}) {
   const setupArgs = [path.join(ROOT, "scripts", "setup.mjs"), "--json", ...(redetect ? ["--redetect"] : [])];
   const setup = await runNode(setupArgs);
@@ -278,18 +423,38 @@ async function systemCheck({ redetect = false } = {}) {
   try { report = JSON.parse(setup.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below */ }
   const settings = (await readJson(SETTINGS)) || {};
 
+  const comfyMode = report?.comfyMode || (settings.comfyMode === "headless" && settings.comfyUrl ? "headless" : "regular");
+  const comfyUrl = comfyMode === "headless" ? normalizeHeadlessUrl(report?.comfyUrl || settings.comfyUrl) : null;
+  if (comfyMode === "headless" && comfyUrl && (redetect || !settings.gpu?.source?.startsWith?.("headless"))) {
+    const hp = await probeHeadlessComfy(comfyUrl, 2500);
+    if (hp.ok && hp.device) {
+      const cleanDev = hp.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim() || hp.device;
+      const v = /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(hp.device) ? "nvidia"
+        : /amd|radeon|gfx/i.test(hp.device) ? "amd"
+        : /intel|arc/i.test(hp.device) ? "intel" : "nvidia";
+      const hGpu = { vendor: v, name: cleanDev, totalMb: hp.vramMb || 0, source: `headless (${comfyUrl})` };
+      const hPatch = { gpu: hGpu };
+      if (hp.torch) {
+        hPatch.torchVersion = hp.torch;
+        hPatch.torchBackend = /rocm|hip/i.test(hp.torch) ? "rocm" : /xpu/i.test(hp.torch) ? "xpu" : "cuda";
+      }
+      Object.assign(settings, await saveSettings(hPatch));
+      if (report) Object.assign(report, hPatch);
+    }
+  }
   const rig = report?.rig || settings.rig || null;
+  const localComfyDir = rig && !/^https?:\/\//i.test(rig) ? resolveComfyDir(rig) : null;
   const python = report?.python || settings.python || null;
   const gpu = report?.gpu || settings.gpu || null;
   const vendor = gpu?.vendor || null;
   const torchBackend = report?.torchBackend || settings.torchBackend || null;
   const torchVersion = report?.torchVersion || settings.torchVersion || null;
-  const modelsDir = settings.modelsDir || report?.modelsDir || (rig ? path.join(rig, "ComfyUI", "models") : null);
+  const modelsDir = settings.modelsDir || report?.modelsDir || (localComfyDir ? path.join(localComfyDir, "models") : null);
 
   const bases = uniqueDirs([
     modelsDir,
     ...(await extraBases(settings.comfyExtraArgs || report?.comfyExtraArgs || [])),
-    rig && path.join(rig, "ComfyUI", "models"),
+    localComfyDir && path.join(localComfyDir, "models"),
   ].filter(Boolean));
   const files = bases.length ? await scanBases(bases) : [];
   const names = new Set(files.map((f) => f.name));
@@ -305,13 +470,16 @@ async function systemCheck({ redetect = false } = {}) {
    * build on NVIDIA, its Vulkan build on AMD/Intel and its CPU build without a
    * card (server/music/gguf-setup.js). Installed means the runtime AND a model
    * file are there; which runtime it is comes from setup's own receipt. */
-  const ggufCli = settings.audioCppCli || path.join(APPDATA, "yue2-gguf", "runtime", "audiocpp_cli.exe");
+  const defaultGgufCli = path.join(APPDATA, "yue2-gguf", "runtime", "audiocpp_cli.exe");
+  const posixGgufCli = path.join(APPDATA, "yue2-gguf", "runtime", "audiocpp_cli");
+  const ggufCli = settings.audioCppCli
+    || (process.platform !== "win32" && !existsSync(defaultGgufCli) && existsSync(posixGgufCli) ? posixGgufCli : defaultGgufCli);
   const ggufModels = settings.yueGgufModelDir || path.join(APPDATA, "yue2-gguf", "models");
   const ggufInstalled = existsSync(ggufCli)
     && ["yue2-3b-q4_0.gguf", "yue2-3b-q8_0.gguf"].some((n) => existsSync(path.join(ggufModels, n)));
   const ggufKind = (await readJson(path.join(path.dirname(ggufCli), "installation.json")))?.runtimeKind
     || (ggufInstalled ? "cuda" : null);   // a receipt without the field predates Vulkan: the CUDA kit
-  const GGUF_RUNS_ON = { cuda: "NVIDIA CUDA", vulkan: "Vulkan", cpu: "the CPU" };
+  const GGUF_RUNS_ON = { cuda: "NVIDIA CUDA", vulkan: "Vulkan", linux_vulkan: "Linux Vulkan", cpu: "the CPU" };
   // Only a CUDA build on a card that is not NVIDIA is a problem (it would fall back to the CPU).
   const ggufMismatch = ggufInstalled && ggufKind === "cuda" && vendor && vendor !== "nvidia";
   /* Both programs, found the way Studio finds them (server/clipjoin.js):
@@ -319,14 +487,14 @@ async function systemCheck({ redetect = false } = {}) {
   const findTool = async (p) => (path.isAbsolute(p) ? (existsSync(p) ? p : null) : which(p));
   const [ffmpeg, ffprobe] = await Promise.all([findTool(ffmpegPath()), findTool(ffprobePath())]);
   const nodeMajor = Number(process.versions.node.split(".")[0]);
-  const comfyOk = !!(rig && python);
+  const comfyOk = comfyMode === "headless" ? !!comfyUrl : !!(rig && python);
   const engineInstall = settings.engineInstall || report?.engineInstall || null;
   const cpuChosen = engineInstall?.backend === "cpu";
   const running = await probeStudio();
 
   /* MiniMax on AMD renders when ComfyUI starts with PyTorch attention and CUDA
    * graphs off (Studio's default); warn only when this launch lacks them. */
-  const cliText = rig ? await readFile(path.join(rig, "ComfyUI", "comfy", "cli_args.py"), "utf-8").catch(() => null) : null;
+  const cliText = localComfyDir ? await readFile(path.join(localComfyDir, "comfy", "cli_args.py"), "utf-8").catch(() => null) : null;
   const launchTier = TIER_FLAGS[settings.prefs?.tier] ? settings.prefs.tier : "auto";
   const amdMusicFixed = hasAmdMusicFix(buildLaunchArgs({
     tierFlags: tierFlags(launchTier, settings),
@@ -338,7 +506,7 @@ async function systemCheck({ redetect = false } = {}) {
     { id: "node", label: "Node.js", status: nodeMajor >= 20 ? "ok" : "bad", value: process.version,
       detail: nodeMajor >= 20 ? "" : "Studio needs Node.js 20 or newer." },
     { id: "gpu", label: "Graphics card",
-      status: gpu ? (vendor === "nvidia" || vendor === "amd" ? "ok" : "warn") : torchBackend ? "ok" : "warn",
+      status: gpu ? (vendor === "nvidia" || vendor === "amd" || vendor === "intel" ? "ok" : "warn") : torchBackend ? "ok" : "warn",
       value: gpu ? `${gpu.name}${gpu.totalMb ? ` · ${(gpu.totalMb / 1024).toFixed(1)} GB` : ""}`
         : torchBackend ? `not read · ComfyUI runs ${torchBackend.toUpperCase()}` : "not detected",
       detail: gpu ? `read from ${gpu.source}` : torchBackend ? "" : "Choose what Studio should run on below." },
@@ -351,8 +519,11 @@ async function systemCheck({ redetect = false } = {}) {
     /* `pick` puts a Change… button on the row. These two are the only settings
      * that can stop Studio starting at all, and the launcher is the screen
      * that is up when they are wrong. */
-    { id: "comfy", label: "ComfyUI install", status: comfyOk ? "ok" : "bad", value: rig || "not found", pick: "comfy",
-      detail: comfyOk ? `${report?.launchFrom ? `flags from ${report.launchFrom} · ` : ""}${python}` : (report?.error || "Install ComfyUI and run it once.") },
+    { id: "comfy", label: "ComfyUI install", status: comfyOk ? "ok" : "bad",
+      value: comfyMode === "headless" ? `headless · ${comfyUrl || "unset"}` : (rig || "not found"), pick: "comfy",
+      detail: comfyMode === "headless"
+        ? `External / headless ComfyUI server (${comfyUrl || "no URL"}) · press Change… to switch between Headless and Regular install`
+        : comfyOk ? `Regular install · ${report?.launchFrom ? `flags from ${report.launchFrom} · ` : ""}${python}` : (report?.error || "Install ComfyUI and run it once, or point to a Regular / Headless install.") },
     { id: "models", label: "Models folder", status: files.length ? "ok" : "warn", value: modelsDir || "—", pick: "models",
       detail: `${files.length} model file${files.length === 1 ? "" : "s"}${bases.length > 1 ? ` across ${bases.length} folders` : ""}` },
     { id: "yue2", label: "YuE2 checkpoint (ComfyUI)", status: yue2.length ? "ok" : "warn",
@@ -587,6 +758,14 @@ function findAppBrowser() {
     pf && path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
     pf86 && path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
     local && path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+  ] : process.platform === "linux" ? [
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/brave-browser",
+    "/usr/bin/microsoft-edge-stable",
+    "/usr/bin/microsoft-edge",
   ] : [];
   return candidates.filter(Boolean).find((p) => existsSync(p)) || null;
 }
@@ -674,22 +853,234 @@ async function chooseFolder(what) {
   }
 
   if (what === "comfy") {
-    const r = await ask(settings.rig, "Choose your ComfyUI folder (the one that contains a ComfyUI folder with main.py)");
-    if (r.unsupported) return { error: "The folder picker is Windows-only. Set \"rig\" in settings.json." };
+    const r = await ask(settings.rig, "Choose your ComfyUI folder (either a ComfyUI folder with main.py or its parent folder)");
+    if (r.unsupported) return { error: "No desktop folder picker available. Use the ComfyUI source dialog to type the folder path or headless URL." };
     if (r.error) return { error: r.error };
     if (!r.path) return { cancelled: true };
-    /* Both spellings, because both are what people see in Explorer: the folder
+    /* Both spellings, because both are what people see in a file manager: the folder
      * that CONTAINS ComfyUI, and ComfyUI itself. */
-    const rig = [r.path, path.dirname(r.path)].find((c) => existsSync(path.join(c, "ComfyUI", "main.py")));
-    if (!rig) return { error: `No ComfyUI in ${r.path} — expected ComfyUI\\main.py inside the folder you pick.` };
+    const hasMain = (c) => existsSync(path.join(c, "ComfyUI", "main.py")) || existsSync(path.join(c, "main.py"));
+    const rig = [r.path, path.dirname(r.path)].find(hasMain);
+    if (!rig) return { error: `No ComfyUI in ${r.path} — expected main.py or ComfyUI/main.py inside the folder you pick.` };
     /* `python` is derived from the rig, so it is dropped rather than left
      * pointing into the previous install's environment. */
-    await saveSettings({ rig }, ["python", "comfyExtraArgs", "launchFrom", "torchBackend", "torchVersion"]);
+    await saveSettings({ comfyMode: "regular", rig }, ["python", "comfyExtraArgs", "launchFrom", "torchBackend", "torchVersion"]);
     checkCache = null;
-    return { path: rig, note: "Re-reading this install's python and launch flags…" };
+    return { path: rig, comfyDir: resolveComfyDir(rig), note: "Re-reading this install's python and launch flags…" };
   }
 
   return { error: "Unknown folder." };
+}
+
+function detectLocalPython(rig, customPy) {
+  if (customPy && customPy !== "headless" && existsSync(customPy)) return customPy;
+  if (!rig) return null;
+  for (const rel of [
+    ["venv", "Scripts", "python.exe"], ["venv", "bin", "python"],
+    ["python_embeded", "python.exe"],
+    [".venv", "Scripts", "python.exe"], [".venv", "bin", "python"],
+    ["ComfyUI", ".venv", "Scripts", "python.exe"], ["ComfyUI", ".venv", "bin", "python"],
+    ["ComfyUI", "venv", "Scripts", "python.exe"], ["ComfyUI", "venv", "bin", "python"],
+  ]) {
+    const p = path.join(rig, ...rel);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+async function comfySourceState() {
+  const s = (await readJson(SETTINGS)) || {};
+  const disc = discoverComfyPresets(s);
+  const headlessServers = await Promise.all(
+    disc.presets.headlessServers.map(async (srv) => {
+      const p = await probeHeadlessComfy(srv.url);
+      return {
+        ...srv,
+        online: !!p.ok,
+        version: p.version || null,
+        torch: p.torch || null,
+        device: p.device || null,
+        vramMb: p.vramMb || null,
+      };
+    }),
+  );
+  return {
+    ...disc,
+    presets: {
+      ...disc.presets,
+      headlessServers,
+    },
+  };
+}
+
+async function handleComfySource(b) {
+  const action = String(b.action || "save");
+  const mode = b.comfyMode === "headless" ? "headless" : "regular";
+
+  if (action === "scan-network") {
+    const s = (await readJson(SETTINGS)) || {};
+    const scan = await scanNetworkComfy({ customHost: String(b.customHost || "").trim() });
+    if (scan.ok && scan.servers?.length) {
+      const existing = Array.isArray(s.headlessHistory) ? s.headlessHistory : [];
+      const mergedUrls = [...new Set([...scan.servers.map((srv) => srv.url), ...existing])].slice(0, 12);
+      await saveSettings({ headlessHistory: mergedUrls });
+    }
+    return scan;
+  }
+
+  if (action === "scan-remote-models") {
+    return scanRemoteModels(b.comfyUrl);
+  }
+
+  if (action === "scan-folder") {
+    const s = (await readJson(SETTINGS)) || {};
+    const resScan = scanPathForComfyAssets(b.scanPath, { maxDepth: 3 });
+    if (resScan.ok && resScan.scannedPath) {
+      const existing = Array.isArray(s.scannedDirs) ? s.scannedDirs : [];
+      const mergedDirs = [...new Set([resScan.scannedPath, ...existing])].slice(0, 12);
+      await saveSettings({ scannedDirs: mergedDirs });
+    }
+    return resScan;
+  }
+
+  if (action === "add-models-also") {
+    const s = (await readJson(SETTINGS)) || {};
+    const extraDir = String(b.modelsDir || "").trim();
+    if (!extraDir || !existsSync(extraDir)) return { error: `Models folder not found: ${extraDir || "(empty)"}` };
+    const resolvedExtra = path.resolve(extraDir);
+    const also = uniqueDirs([...(Array.isArray(s.modelsAlso) ? s.modelsAlso : []), resolvedExtra]);
+    await saveSettings({ modelsAlso: also });
+    checkCache = null;
+    return { ok: true, modelsAlso: also, note: `Added ${resolvedExtra} to extra model folders.` };
+  }
+
+  if (action === "browse") {
+    const s = (await readJson(SETTINGS)) || {};
+    const target = String(b.target || "rig");
+    const startDir = target === "models" ? (s.modelsDir || "") : target === "output" ? (s.outputDir || "") : (s.rig || "");
+    const title = target === "models"
+      ? MODELS_PROMPT
+      : target === "output"
+        ? "Choose the folder ComfyUI saves songs and pictures to"
+        : target === "scan"
+          ? "Choose a folder, drive, or network mount to scan for ComfyUI and models"
+          : "Choose your ComfyUI folder (containing main.py or ComfyUI/main.py)";
+    const r = await pickFolderDialog(startDir, title);
+    if (r.unsupported) return { error: "No native GUI folder dialog found; enter the folder path in the text box and click Scan." };
+    if (r.error) return { error: r.error };
+    if (!r.path) return { cancelled: true };
+    if (target === "models") return { ok: true, modelsDir: r.path };
+    if (target === "output") return { ok: true, outputDir: r.path };
+    if (target === "scan") return { ok: true, scanPath: r.path };
+    const hasMain = (c) => existsSync(path.join(c, "ComfyUI", "main.py")) || existsSync(path.join(c, "main.py"));
+    const rig = [r.path, path.dirname(r.path)].find(hasMain) || r.path;
+    const py = detectLocalPython(rig, null);
+    const cDir = resolveComfyDir(rig);
+    return {
+      ok: true,
+      rig: cDir,
+      comfyDir: cDir,
+      detectedPython: py,
+      modelsDir: existsSync(path.join(cDir, "models")) ? path.join(cDir, "models") : undefined,
+      outputDir: path.join(cDir, "output"),
+    };
+  }
+
+  const rawModels = typeof b.modelsDir === "string" ? b.modelsDir.trim() : "";
+  const rawOutput = typeof b.outputDir === "string" ? b.outputDir.trim() : "";
+  if (rawModels && !existsSync(rawModels)) {
+    return { error: `Models folder not found at ${rawModels}.` };
+  }
+
+  if (mode === "headless") {
+    const url = normalizeHeadlessUrl(b.comfyUrl);
+    if (!url) return { error: "Enter a valid HTTP(S) URL for your headless ComfyUI server (e.g. http://127.0.0.1:8188 or http://<server-ip>:8188)." };
+    const probe = await probeHeadlessComfy(url);
+    if (action === "test") return probe;
+    if (child) return { error: "Stop Studio first — the ComfyUI connection is read when Studio starts." };
+    const s = (await readJson(SETTINGS)) || {};
+    const existingHistory = Array.isArray(s.headlessHistory) ? s.headlessHistory : [];
+    const patch = {
+      comfyMode: "headless",
+      comfyUrl: url,
+      headlessHistory: [...new Set([url, ...existingHistory])].slice(0, 12),
+    };
+    if (rawModels) {
+      patch.modelsDir = path.resolve(rawModels);
+      patch.modelsDirPinned = true;
+    }
+    if (rawOutput) {
+      await mkdir(path.resolve(rawOutput), { recursive: true }).catch(() => {});
+      patch.outputDir = path.resolve(rawOutput);
+    }
+    if (probe.ok && probe.torch) {
+      patch.torchVersion = probe.torch;
+      patch.torchBackend = /rocm|hip/i.test(probe.torch) ? "rocm" : /xpu/i.test(probe.torch) ? "xpu" : "cuda";
+    }
+    if (probe.ok && probe.device) {
+      const cleanDev = probe.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim() || probe.device;
+      const v = /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(probe.device) ? "nvidia"
+        : /amd|radeon|gfx/i.test(probe.device) ? "amd"
+        : /intel|arc/i.test(probe.device) ? "intel" : "nvidia";
+      patch.gpu = { vendor: v, name: cleanDev, totalMb: probe.vramMb || 0, source: `headless (${url})` };
+    }
+    await saveSettings(patch);
+    checkCache = null;
+    return {
+      ok: true,
+      comfyMode: "headless",
+      comfyUrl: url,
+      probe,
+      note: probe.ok
+        ? `Saved headless ComfyUI at ${url} (${probe.version}${probe.device ? ` · ${probe.device}` : ""}).`
+        : `Saved headless ComfyUI URL ${url}. (Server did not answer right now: ${probe.error} Start your headless ComfyUI before launching Full Studio.)`,
+    };
+  }
+
+  // Regular (local folder) install
+  const rawRig = String(b.rig || "").trim();
+  if (!rawRig) return { error: "Enter or select your local ComfyUI folder." };
+  const hasMain = (c) => existsSync(path.join(c, "ComfyUI", "main.py")) || existsSync(path.join(c, "main.py"));
+  const rig = [rawRig, path.dirname(rawRig)].find(hasMain);
+  if (!rig) {
+    return { error: `No ComfyUI main.py found at ${rawRig} (checked ${path.join(rawRig, "main.py")} and ${path.join(rawRig, "ComfyUI", "main.py")}).` };
+  }
+  const customPy = String(b.python || "").trim();
+  if (customPy && !existsSync(customPy)) {
+    return { error: `Python executable not found at ${customPy}. Leave blank to auto-detect.` };
+  }
+  const py = detectLocalPython(rig, customPy || null);
+  const comfyDir = resolveComfyDir(rig);
+  if (action === "test") {
+    if (!py) return { ok: false, rig, comfyDir, error: `Found ComfyUI at ${comfyDir}, but no Python venv was found automatically. Provide the Python path or create a venv.` };
+    return { ok: true, rig, comfyDir, python: py, note: `Valid Regular ComfyUI install at ${comfyDir} using Python ${py}.` };
+  }
+  if (child) return { error: "Stop Studio first — the ComfyUI install folder is read when Studio starts." };
+  const removeKeys = ["comfyExtraArgs", "launchFrom", "torchBackend", "torchVersion"];
+  const patch = { comfyMode: "regular", rig };
+  if (customPy) patch.python = customPy;
+  else if (py) patch.python = py;
+  else removeKeys.push("python");
+  if (rawModels) {
+    patch.modelsDir = path.resolve(rawModels);
+    patch.modelsDirPinned = true;
+  }
+  if (rawOutput) {
+    await mkdir(path.resolve(rawOutput), { recursive: true }).catch(() => {});
+    patch.outputDir = path.resolve(rawOutput);
+  }
+  await saveSettings(patch, removeKeys);
+  checkCache = null;
+  return {
+    ok: true,
+    comfyMode: "regular",
+    rig,
+    comfyDir,
+    python: py,
+    note: py
+      ? `Saved Regular ComfyUI install at ${comfyDir} (Python: ${py}).`
+      : `Saved Regular ComfyUI folder ${comfyDir}. Note: no Python venv was found inside it yet.`,
+  };
 }
 
 /* ── the Advanced settings ─────────────────────────────────────────────────
@@ -700,17 +1091,21 @@ async function chooseFolder(what) {
  * applied by Studio at its next start; the preview is the flags it will use. */
 async function advancedState() {
   const s = (await readJson(SETTINGS)) || {};
-  const rig = s.rig || null;
-  const cli = rig ? await readFile(path.join(rig, "ComfyUI", "comfy", "cli_args.py"), "utf-8").catch(() => null) : null;
+  const rig = s.rig && !/^https?:\/\//i.test(s.rig) ? s.rig : null;
+  const cDir = rig ? resolveComfyDir(rig) : null;
+  const cli = cDir ? await readFile(path.join(cDir, "comfy", "cli_args.py"), "utf-8").catch(() => null) : null;
   const vendor = vendorOf(s.gpu, s.torchBackend);
   const amdFix = { mode: fixMode(s.comfyAmdFix), vendor, applies: fixApplies(s.comfyAmdFix, vendor) };
   const values = effectiveValues(s.comfyOptions, s.comfyOptionsRev, cli, { fix: amdFix.mode, vendor });
   const useInstallFlags = s.comfyUseInstallFlags !== false;
   const tier = TIER_FLAGS[s.prefs?.tier] ? s.prefs.tier : "auto";
   const installFlags = Array.isArray(s.comfyExtraArgs) ? s.comfyExtraArgs.map(String) : [];
-  const def = (sub) => (rig ? path.join(rig, "ComfyUI", sub) : null);
+  const def = (sub) => (cDir ? path.join(cDir, sub) : null);
   return {
-    rig, cliFound: !!cli, options: availableOptions(cli), values, useInstallFlags, installFlags, tier, amdFix,
+    rig: rig || (s.comfyMode === "headless" ? s.comfyUrl : null),
+    comfyMode: s.comfyMode === "headless" ? "headless" : "regular",
+    comfyUrl: s.comfyUrl || null,
+    cliFound: !!cli, options: availableOptions(cli), values, useInstallFlags, installFlags, tier, amdFix,
     folders: {
       models: { path: s.modelsDir || null, default: def("models") },
       output: { path: s.outputDir || null, default: def("output") },
@@ -826,6 +1221,10 @@ function makeServer(portRef) {
       if (url.pathname === "/api/advanced") {
         if (req.method === "POST") return send(res, 200, await saveAdvanced(await readBody(req)));
         return send(res, 200, await advancedState());
+      }
+      if (url.pathname === "/api/comfy-source") {
+        if (req.method === "POST") return send(res, 200, await handleComfySource(await readBody(req)));
+        return send(res, 200, await comfySourceState());
       }
       if (req.method === "POST" && url.pathname === "/api/show") { showWindow(); return send(res, 200, { ok: true }); }
       if (req.method === "POST" && url.pathname === "/api/pick") {

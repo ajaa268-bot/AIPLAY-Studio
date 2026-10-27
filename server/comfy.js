@@ -147,6 +147,26 @@ export class ComfySupervisor extends EventEmitter {
 
   async start() {
     if (this.proc) return;
+    if (config.comfy?.mode === "headless" && config.comfy?.headlessUrl) {
+      this.startedAt = Date.now();
+      this.proc = engine.attachHeadless(config.comfy.headlessUrl);
+      this.port = engine.portForSpawn;
+      await this.#waitForReady();
+      const hf = engine.headlessFacts();
+      if (hf?.torch) this.backend.torch = hf.torch;
+      if (hf?.device) this.backend.device = hf.device;
+      if (hf?.vramMb) {
+        this.backend.totalVramMb = hf.vramMb;
+        const cleanDev = hf.device ? hf.device.replace(/^cuda:\d+\s*/i, "").split(":")[0].trim() || hf.device : "Headless GPU";
+        const vendor = /amd|radeon|gfx/i.test(hf.device || "") ? "amd"
+          : /intel|arc/i.test(hf.device || "") ? "intel" : "nvidia";
+        setGpuFallback({ name: cleanDev, totalMb: hf.vramMb, vendor, source: `headless (${config.comfy.headlessUrl})` });
+      }
+      this.#restarts = 0;
+      this.stopping = false;
+      this.failure = null;
+      return;
+    }
     /* Room on the card for the desktop and other programs, measured now
      * (server/vramreserve.js): on AMD and Intel under Windows, Dynamic VRAM
      * cannot see them, and a render that crowds them out ends in a driver
@@ -478,6 +498,7 @@ export class ComfySupervisor extends EventEmitter {
      * shutdown as a crash and race a respawn against the caller. */
     this.stopping = true;
     if (!this.proc) { engine.detachChild(); return; }
+    if (this.proc.headless) { this.proc.kill(); this.proc = null; this.ready = false; engine.detachChild(); return; }
     this.proc.kill();
     await sleep(400);
     if (this.proc) this.proc.kill("SIGKILL");
