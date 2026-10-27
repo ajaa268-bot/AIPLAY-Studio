@@ -31,7 +31,11 @@ settings.json          # the per-machine config: absolute paths, possibly tokens
 node_modules/
 # A private Node.js that AIPLAY Studio Setup.exe puts beside the launcher.
 /node/
-dist/
+dist/*
+!dist/linux/
+dist/linux/*
+!dist/linux/*.AppImage
+!dist/linux/*.AppImage.sha256
 *.tgz
 
 # ---- Backups. `.bak-<tag>` is the convention used before every risky edit,

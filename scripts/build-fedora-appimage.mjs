@@ -232,6 +232,14 @@ async function main() {
       dereference: false,
       verbatimSymlinks: true,
     });
+    await rm(path.join(usrLib, "runtime/include"), { recursive: true, force: true }).catch(() => {});
+    await rm(path.join(usrLib, "runtime/share"), { recursive: true, force: true }).catch(() => {});
+    await rm(path.join(usrLib, "runtime/lib/node_modules/npm"), { recursive: true, force: true }).catch(() => {});
+    await rm(path.join(usrLib, "runtime/bin/npm"), { force: true }).catch(() => {});
+    await rm(path.join(usrLib, "runtime/bin/npx"), { force: true }).catch(() => {});
+    try {
+      execFileSync("strip", ["--strip-unneeded", path.join(usrLib, "runtime/bin/node")]);
+    } catch { /* strip optional */ }
     await chmod(path.join(usrLib, "runtime/bin/node"), 0o755);
 
     console.log("  Staging AIPLAY Studio application payload & dependencies…");
@@ -240,6 +248,10 @@ async function main() {
       recursive: true,
       dereference: true,
     });
+    // Trim redundant build/example artifacts in node_modules (three/examples, .map files) to keep AppImage < 50 MB for Git
+    await rm(path.join(payloadDir, "node_modules/three/examples"), { recursive: true, force: true }).catch(() => {});
+    await rm(path.join(payloadDir, "node_modules/three/src"), { recursive: true, force: true }).catch(() => {});
+    await rm(path.join(payloadDir, "node_modules/ag-psd/dist/bundle.js"), { force: true }).catch(() => {});
 
     let commit = "local";
     try {
