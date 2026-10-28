@@ -63,7 +63,8 @@ const isEngine = async (rig) => (await exists(path.join(rig, "ComfyUI", "main.py
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 
 /** A ComfyUI needs a python that can actually run it. */
-async function pythonFor(rig, savedPy = null) {
+async function pythonFor(rig) {
+  const savedPy = arguments[1];
   if (savedPy && savedPy !== "headless" && await exists(savedPy)) return savedPy;
   for (const rel of [["venv", "Scripts", "python.exe"], ["venv", "bin", "python"],
                      ["python_embeded", "python.exe"], [".venv", "Scripts", "python.exe"],
